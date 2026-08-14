@@ -2,10 +2,15 @@
 Locust load tests for the SPYCE dating API.
 
 Each virtual user signs up (magic OTP), completes onboarding, then loops
-across the real client surfaces: feed, like/pass/match, chat, confessions,
-profile, presence, catalogs, geo, theme, wallet, calls, analytics.
+across the real client surfaces:
+- Feed & Feed AI (Django v1 + FastAPI v2 with filters & cache refresh)
+- Like / Pass / Interested / Received Likes / Matches
+- Send Request & Accept Request (Direct Conversation Requests)
+- Confession Social (Create, Detail, Relate/Like, Repost, Comments, Chat Request, Request List/Count/Accept/Reject, Moods)
+- Profile (Me, Patch, Other, Username Available, Mood get/set, Avatars, Upload Status)
+- Catalogs, Theme, Geo, Presence, Notifications, Subscriptions, Wallet, Call, Verification, Moderation, Analytics, Health.
 
-Assumes the target has:
+Assumes the target backend has:
   DISABLE_RATE_LIMITING=True
   USE_TEST_OTP=True, MAGIC_OTP=123456
   REQUIRE_CAPTCHA=False
@@ -13,7 +18,7 @@ Assumes the target has:
 
 Run:
   locust -f load/locustfile.py --host http://127.0.0.1:8000
-  locust -f load/locustfile.py --host https://api01.spycenow.com \\
+  locust -f load/locustfile.py --host https://api01.spycenow.com \
     --users 50 --spawn-rate 5 --run-time 3m --headless
 """
 from __future__ import annotations
@@ -30,11 +35,16 @@ MAGIC_OTP = os.getenv("MAGIC_OTP", "123456")
 LAT = float(os.getenv("LOAD_LAT", "12.9716"))
 LON = float(os.getenv("LOAD_LON", "77.5946"))
 
-# Shared across VUs so likes can land on other load-test users and create matches.
+# Shared across VUs so likes/requests can land on other load-test users and create matches.
 _lock = threading.Lock()
-_user_ids: deque[str] = deque(maxlen=800)
-_feed_ids: deque[str] = deque(maxlen=800)
-_confession_ids: deque[str] = deque(maxlen=400)
+_user_ids: deque[str] = deque(maxlen=1000)
+_feed_ids: deque[str] = deque(maxlen=1000)
+_confession_ids: deque[str] = deque(maxlen=500)
+
+# (receiver_user_id, request_id)
+_pending_confession_reqs: deque[tuple[str, str]] = deque(maxlen=500)
+# (receiver_user_id, sender_user_id)
+_pending_conversation_reqs: deque[tuple[str, str]] = deque(maxlen=500)
 
 MOOD_TAGS = (
     "LONELY",
@@ -44,6 +54,8 @@ MOOD_TAGS = (
     "GRATEFUL",
     "FANTASY",
 )
+
+CITIES = ("Bangalore", "Mumbai", "Delhi", "Hyderabad", "Pune")
 
 
 def _email() -> str:
@@ -61,19 +73,30 @@ def _jitter_coords() -> tuple[float, float]:
     )
 
 
-def _pool_add(pool: deque[str], value: str | None) -> None:
+def _pool_add(pool: deque, value: Any) -> None:
     if not value:
         return
-    value = str(value)
     with _lock:
         if value not in pool:
             pool.append(value)
 
 
-def _pool_pick(pool: deque[str], exclude: str | None = None) -> str | None:
+def _pool_pick(pool: deque, exclude: str | None = None) -> Any | None:
     with _lock:
-        choices = [x for x in pool if x and x != exclude]
+        if not pool:
+            return None
+        choices = [x for x in pool if x and (isinstance(x, tuple) or str(x) != exclude)]
     return random.choice(choices) if choices else None
+
+
+def _pop_pending_for(pool: deque[tuple[str, str]], target_receiver_id: str) -> str | None:
+    with _lock:
+        for item in list(pool):
+            receiver_id, payload_id = item
+            if receiver_id == target_receiver_id:
+                pool.remove(item)
+                return payload_id
+    return None
 
 
 def _json(res):
@@ -125,7 +148,7 @@ def _extract_ids(data, *keys: str) -> list[str]:
 
 
 class SpyceUser(HttpUser):
-    """Full app session: onboard once, then hit every client API."""
+    """Full app session: onboard once, then hit every client API surface."""
 
     wait_time = between(0.3, 1.2)
     weight = 10
@@ -141,10 +164,10 @@ class SpyceUser(HttpUser):
         self.gender_id = 1
         self.sexuality_id = 1
         self.mood_ids: list = []
-        self.seen_candidates: deque[str] = deque(maxlen=80)
-        self.confession_ids: deque[str] = deque(maxlen=40)
-        self.match_ids: deque[str] = deque(maxlen=20)
-        self.conversation_ids: deque[str] = deque(maxlen=20)
+        self.seen_candidates: deque[str] = deque(maxlen=100)
+        self.confession_ids: deque[str] = deque(maxlen=50)
+        self.match_ids: deque[str] = deque(maxlen=30)
+        self.conversation_ids: deque[str] = deque(maxlen=30)
         self._authenticate_and_onboard()
 
     def _headers(self) -> dict:
@@ -315,7 +338,7 @@ class SpyceUser(HttpUser):
             _pool_add(_user_ids, self.user_id)
 
     # ------------------------------------------------------------------ #
-    # Health / session
+    # Health / session / token
     # ------------------------------------------------------------------ #
     @task(4)
     def health(self):
@@ -359,9 +382,9 @@ class SpyceUser(HttpUser):
         self._req("POST", "/api/v1/auth/ws-ticket/", "auth:ws_ticket", json={})
 
     # ------------------------------------------------------------------ #
-    # Feed (Django v1 + FastAPI v2)
+    # Feed & Feed AI (Django v1 + FastAPI v2 + AI recalculation & filters)
     # ------------------------------------------------------------------ #
-    @task(18)
+    @task(16)
     def feed_v1(self):
         if not self.access:
             return
@@ -374,8 +397,31 @@ class SpyceUser(HttpUser):
         if res.status_code == 200:
             self._remember_users(_extract_ids(_json(res), "id", "user_id"))
 
+    @task(6)
+    def feed_v1_ai_refresh(self):
+        """Feed AI cache refresh + multi-attribute filtering."""
+        if not self.access:
+            return
+        res = self._req(
+            "GET",
+            "/api/v1/feed/",
+            "feed:v1_ai_refresh",
+            params={
+                "count": 15,
+                "cursor": 0,
+                "refresh": "true",
+                "min_age": 18,
+                "max_age": 35,
+                "currently_online": "true",
+                "city": random.choice(CITIES),
+            },
+        )
+        if res.status_code == 200:
+            self._remember_users(_extract_ids(_json(res), "id", "user_id"))
+
     @task(12)
     def feed_v2(self):
+        """FastAPI v2 Feed."""
         if not self.access:
             return
         res = self._req(
@@ -388,8 +434,30 @@ class SpyceUser(HttpUser):
         if res.status_code == 200:
             self._remember_users(_extract_ids(_json(res), "id", "user_id"))
 
+    @task(6)
+    def feed_v2_ai_refresh(self):
+        """FastAPI v2 Feed with AI refresh and location mode filters."""
+        if not self.access:
+            return
+        res = self._req(
+            "GET",
+            "/api/v2/feed/",
+            "feed:v2_ai_refresh",
+            params={
+                "count": 15,
+                "refresh": "true",
+                "location_mode": "nearby",
+                "currently_online": "1",
+                "lat": self.lat,
+                "lon": self.lon,
+            },
+            also_ok=(400, 403, 404),
+        )
+        if res.status_code == 200:
+            self._remember_users(_extract_ids(_json(res), "id", "user_id"))
+
     # ------------------------------------------------------------------ #
-    # Likes / pass / incoming / interested
+    # Likes / Pass / Interested / Requests
     # ------------------------------------------------------------------ #
     @task(12)
     def like_candidate(self):
@@ -447,25 +515,45 @@ class SpyceUser(HttpUser):
         if res.status_code == 200:
             self._remember_users(_extract_ids(_json(res), "id", "user_id"))
 
-    @task(2)
+    @task(3)
     def start_conversation_request(self):
+        """Send a direct connection/chat request to a candidate."""
         if not self.access:
             return
         target = self._pick_target()
         if not target:
             return
-        self._req(
+        res = self._req(
             "POST",
             "/api/v1/interaction/start_conversation/",
             "interaction:start_conversation",
             json={
                 "target_user_id": target,
-                "message": "Hey, saw you on Discover — want to chat?",
+                "message": "Hey! Saw your profile on Discover — let's connect!",
             },
+        )
+        if res.status_code in (200, 201):
+            _pool_add(_pending_conversation_reqs, (target, self.user_id))
+
+    @task(2)
+    def accept_conversation_request(self):
+        """Accept an incoming connection/chat request."""
+        if not self.access or not self.user_id:
+            return
+        sender_id = _pop_pending_for(_pending_conversation_reqs, self.user_id)
+        if not sender_id:
+            sender_id = _pool_pick(_user_ids, exclude=self.user_id)
+        if not sender_id:
+            return
+        self._req(
+            "POST",
+            "/api/v1/interaction/accept_request/",
+            "interaction:accept_request",
+            json={"sender_id": sender_id},
         )
 
     # ------------------------------------------------------------------ #
-    # Matches + chat
+    # Matches + Chat
     # ------------------------------------------------------------------ #
     @task(6)
     def matches(self):
@@ -514,7 +602,7 @@ class SpyceUser(HttpUser):
             "conversations:draft_get",
         )
 
-    @task(3)
+    @task(4)
     def send_chat_message(self):
         if not self.access or not self.conversation_ids:
             return
@@ -531,7 +619,7 @@ class SpyceUser(HttpUser):
         )
 
     # ------------------------------------------------------------------ #
-    # Confessions / social
+    # Confession Social (Create, Feed, Detail, Relate/Like, Repost, Comments, Chat Request, Accept/Reject)
     # ------------------------------------------------------------------ #
     @task(8)
     def confession_list(self):
@@ -552,7 +640,7 @@ class SpyceUser(HttpUser):
         )
         self._store_confessions(res)
 
-    @task(3)
+    @task(4)
     def confession_create(self):
         if not self.access:
             return
@@ -578,8 +666,9 @@ class SpyceUser(HttpUser):
             self.confession_ids.appendleft(str(cid))
             _pool_add(_confession_ids, str(cid))
 
-    @task(4)
+    @task(8)
     def confession_engage(self):
+        """Full confession interaction: Detail, Relate (Like), Repost, Comment, Report."""
         if not self.access:
             return
         cid = None
@@ -589,22 +678,34 @@ class SpyceUser(HttpUser):
             cid = _pool_pick(_confession_ids)
         if not cid:
             return
+
         self._req("GET", f"/api/v1/social/{cid}/", "confession:detail")
         self._req("POST", f"/api/v1/social/{cid}/relate/", "confession:relate", json={})
-        if random.random() < 0.35:
-            self._req("POST", f"/api/v1/social/{cid}/repost/", "confession:repost", json={})
+
         if random.random() < 0.4:
+            self._req("POST", f"/api/v1/social/{cid}/repost/", "confession:repost", json={})
+
+        if random.random() < 0.5:
             self._req(
                 "POST",
                 f"/api/v1/social/{cid}/comments/",
-                "confession:comment",
+                "confession:comment_create",
                 json={"text": "Relatable load-test comment.", "is_anonymous": True},
             )
         else:
-            self._req("GET", f"/api/v1/social/{cid}/comments/", "confession:comments")
+            self._req("GET", f"/api/v1/social/{cid}/comments/", "confession:comments_list")
 
-    @task(1)
+        if random.random() < 0.1:
+            self._req(
+                "POST",
+                f"/api/v1/social/{cid}/report/",
+                "confession:report",
+                json={"reason": "OTHER", "description": "Load test report check"},
+            )
+
+    @task(3)
     def confession_chat_request(self):
+        """Send anonymous chat request on a confession."""
         if not self.access:
             return
         cid = _pool_pick(_confession_ids) or (
@@ -612,20 +713,53 @@ class SpyceUser(HttpUser):
         )
         if not cid:
             return
-        self._req(
+        res = self._req(
             "POST",
             f"/api/v1/social/{cid}/chat-request/",
             "confession:chat_request",
-            json={"message": "Hey, your confession hit hard. Want to talk?"},
+            json={"message": "Hey, your confession hit hard. Want to talk about it?"},
         )
+        data = _json(res) or {}
+        req_id = data.get("id")
+        if req_id and self.user_id:
+            # We don't easily know confession author's ID, so add to general pending pool
+            target_user = _pool_pick(_user_ids, exclude=self.user_id)
+            if target_user:
+                _pool_add(_pending_confession_reqs, (target_user, str(req_id)))
 
-    @task(2)
-    def confession_requests(self):
+    @task(3)
+    def confession_requests_and_actions(self):
+        """List incoming confession requests, check badge count, accept/reject."""
         if not self.access:
             return
         self._req("GET", "/api/v1/social/moods/", "confession:moods")
-        self._req("GET", "/api/v1/confession-requests/", "confession:requests")
         self._req("GET", "/api/v1/confession-requests/count/", "confession:request_count")
+
+        req_res = self._req("GET", "/api/v1/confession-requests/", "confession:requests")
+        req_data = _json(req_res)
+        req_ids = _extract_ids(req_data, "id")
+
+        if not req_ids and self.user_id:
+            p_id = _pop_pending_for(_pending_confession_reqs, self.user_id)
+            if p_id:
+                req_ids.append(p_id)
+
+        if req_ids:
+            target_req_id = req_ids[0]
+            if random.random() < 0.7:
+                self._req(
+                    "POST",
+                    f"/api/v1/confession-requests/{target_req_id}/accept/",
+                    "confession:request_accept",
+                    json={},
+                )
+            else:
+                self._req(
+                    "POST",
+                    f"/api/v1/confession-requests/{target_req_id}/reject/",
+                    "confession:request_reject",
+                    json={},
+                )
 
     def _store_confessions(self, res) -> None:
         if res.status_code != 200:
@@ -636,7 +770,7 @@ class SpyceUser(HttpUser):
             _pool_add(_confession_ids, cid)
 
     # ------------------------------------------------------------------ #
-    # Profile
+    # Profile & Moods
     # ------------------------------------------------------------------ #
     @task(8)
     def profile_me(self):
@@ -700,7 +834,7 @@ class SpyceUser(HttpUser):
             )
 
     # ------------------------------------------------------------------ #
-    # Catalogs / theme / geo
+    # Catalogs / Theme / Geo
     # ------------------------------------------------------------------ #
     @task(3)
     def option_catalogs(self):
@@ -739,7 +873,7 @@ class SpyceUser(HttpUser):
         self._req("GET", "/api/v1/geo/autocomplete/", "geo:autocomplete", params={"q": q})
 
     # ------------------------------------------------------------------ #
-    # Presence / devices / notifications
+    # Presence / Devices / Notifications
     # ------------------------------------------------------------------ #
     @task(6)
     def last_active(self):
@@ -753,11 +887,12 @@ class SpyceUser(HttpUser):
             json={"lat": self.lat, "lon": self.lon},
         )
 
-    @task(1)
+    @task(2)
     def devices_and_push(self):
         if not self.access:
             return
         self._req("GET", "/api/v1/users/devices/", "users:devices")
+        self._req("GET", "/api/v1/notifications/", "notifications:list")
         self._req(
             "POST",
             "/api/v1/notifications/devices/",
@@ -769,7 +904,7 @@ class SpyceUser(HttpUser):
         )
 
     # ------------------------------------------------------------------ #
-    # Wallet / subscriptions / calls
+    # Wallet / Subscriptions / Calls
     # ------------------------------------------------------------------ #
     @task(2)
     def subscriptions(self):
@@ -790,7 +925,7 @@ class SpyceUser(HttpUser):
         self._req("GET", "/api/v1/call-time/packages/", "call:packages")
 
     # ------------------------------------------------------------------ #
-    # Analytics / verification / moderation reads
+    # Analytics / Verification / Moderation
     # ------------------------------------------------------------------ #
     @task(2)
     def analytics_event(self):
@@ -860,6 +995,6 @@ class AuthOnlyUser(HttpUser):
 def on_locust_init(environment, **kwargs):
     print(
         f"[SPYCE load] MAGIC_OTP={MAGIC_OTP} | "
-        "full API (feed/like/match/confession/profile) | "
+        "full API (feed/feed AI/like/pass/requests/confessions/profile/etc) | "
         f"host={getattr(environment, 'host', None)}"
     )

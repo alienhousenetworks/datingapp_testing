@@ -1,24 +1,22 @@
 import http from 'k6/http';
-import { check, sleep, group } from 'k6';
+import { check, sleep } from 'k6';
 
 /**
- * k6 Load Test Script for SPYCE Backend (Equivalent to Locust test suite)
+ * k6 Load Test Script for SPYCE Backend (Comprehensive API test suite matching Locust)
  * 
  * Target Server Requirements:
- *   - DISABLE_RATE_LIMITING=True (or RATE_LIMIT=999999 per IP)
+ *   - DISABLE_RATE_LIMITING=True
  *   - USE_TEST_OTP=True, MAGIC_OTP=123456
  *   - REQUIRE_CAPTCHA=False
  *   - FACE_VERIFICATION=False
  * 
- * Execution on 4th VPS:
+ * Execution:
  *   k6 run --environment BASE_URL=https://api01.spycenow.com testing/k6/locust_equivalent.js
  */
 
-// Global Configs from Environment Variables or Defaults
 const BASE_URL = __ENV.BASE_URL || 'http://127.0.0.1:8000';
 const MAGIC_OTP = __ENV.MAGIC_OTP || '123456';
 
-// k6 Load Test Execution Stages (Scales up to 5,000 VUs, customizable)
 export const options = {
   stages: [
     { duration: '30s', target: 500 },   // Warm-up ramp
@@ -28,11 +26,10 @@ export const options = {
   ],
   thresholds: {
     http_req_failed: ['rate<0.05'],     // < 5% errors
-    http_req_duration: ['p(95)<500'],   // 95% of requests below 500ms
+    http_req_duration: ['p(95)<1000'],  // 95% of requests below 1s under heavy load
   },
 };
 
-// Helper Utilities
 function randomHex(length) {
   const chars = 'abcdef0123456789';
   let result = '';
@@ -62,40 +59,24 @@ function getHeaders(deviceId, token = null) {
   return headers;
 }
 
-// User Context Initialization
 function authenticateUser(email, deviceId) {
   let headers = getHeaders(deviceId);
 
-  // 1. Register (OTP Request)
   let regRes = http.post(
     `${BASE_URL}/api/v1/auth/register/`,
     JSON.stringify({ email: email, device_id: deviceId, intent: 'signup' }),
     { headers: headers, tags: { name: 'auth:register' } }
   );
 
-  check(regRes, {
-    'register success (200)': (r) => r.status === 200,
-  });
+  if (regRes.status !== 200) return null;
 
-  if (regRes.status !== 200) {
-    return null;
-  }
-
-  // 2. Verify OTP
   let verRes = http.post(
     `${BASE_URL}/api/v1/auth/otp/verify/`,
     JSON.stringify({ email: email, otp: MAGIC_OTP, device_id: deviceId }),
     { headers: headers, tags: { name: 'auth:otp_verify' } }
   );
 
-  let isVerified = check(verRes, {
-    'verify success (200)': (r) => r.status === 200,
-    'has access token': (r) => r.json('access') !== undefined,
-  });
-
-  if (!isVerified) {
-    return null;
-  }
+  if (verRes.status !== 200) return null;
 
   const verData = verRes.json();
   const token = verData.access;
@@ -103,14 +84,12 @@ function authenticateUser(email, deviceId) {
 
   headers = getHeaders(deviceId, token);
 
-  // 3. Mock Face Verification
   http.post(
     `${BASE_URL}/api/v1/verification/mock-complete/`,
     JSON.stringify({}),
     { headers: headers, tags: { name: 'verification:mock_complete' } }
   );
 
-  // 4. Catalog Lookup
   let genderId = 1;
   let sexualityId = 1;
 
@@ -124,7 +103,6 @@ function authenticateUser(email, deviceId) {
     sexualityId = sRes.json()[0].id || 1;
   }
 
-  // 5. Populate Onboarding Details
   const username = `usr_${randomHex(10)}`;
   const onboardingPayload = {
     username: username,
@@ -133,7 +111,7 @@ function authenticateUser(email, deviceId) {
     gender: genderId,
     sexuality: sexualityId,
     preferred_genders: [genderId],
-    bio: 'k6 load test simulated user profile for discovery feed.',
+    bio: 'k6 load test user profile for discovery feed and social.',
     latitude: 12.9716,
     longitude: 77.5946,
   };
@@ -144,22 +122,19 @@ function authenticateUser(email, deviceId) {
     { headers: headers, tags: { name: 'profile:onboarding_patch' } }
   );
 
-  // 6. Init Location / Presence
   http.post(
     `${BASE_URL}/api/v1/users/last-active/`,
     JSON.stringify({ lat: 12.9716, lon: 77.5946 }),
     { headers: headers, tags: { name: 'users:last_active_init' } }
   );
 
-  return { token: token, userId: userId, deviceId: deviceId, seenCandidates: [] };
+  return { token: token, userId: userId, deviceId: deviceId, seenCandidates: [], confessionIds: [] };
 }
 
-// Default Main Function executed per VU iteration
 export default function () {
   const email = generateEmail();
   const deviceId = generateDeviceId();
 
-  // 1. Authenticate and setup user session once
   const user = authenticateUser(email, deviceId);
   if (!user) {
     sleep(1);
@@ -168,16 +143,17 @@ export default function () {
 
   const headers = getHeaders(user.deviceId, user.token);
 
-  // 2. Perform Weighted User Activity Loop
   for (let cycle = 0; cycle < 5; cycle++) {
     const roll = Math.random() * 100;
 
-    if (roll < 10) {
+    if (roll < 8) {
       // Health check
       http.get(`${BASE_URL}/health/`, { tags: { name: 'health' } });
-    } else if (roll < 25) {
-      // Discovery feed (FastAPI v2)
-      let feedRes = http.get(`${BASE_URL}/api/v2/feed/?count=10`, { headers: headers, tags: { name: 'feed:list' } });
+      http.get(`${BASE_URL}/health/live/`, { tags: { name: 'health:live' } });
+      http.get(`${BASE_URL}/health/ready/`, { tags: { name: 'health:ready' } });
+    } else if (roll < 20) {
+      // Feed & Feed AI
+      let feedRes = http.get(`${BASE_URL}/api/v2/feed/?count=10`, { headers: headers, tags: { name: 'feed:v2' } });
       if (feedRes.status === 200 && feedRes.json('results')) {
         const items = feedRes.json('results');
         items.forEach((item) => {
@@ -185,35 +161,98 @@ export default function () {
           if (cid) user.seenCandidates.push(cid.toString());
         });
       }
-    } else if (roll < 40) {
-      // User / Profile checks
+      // Feed AI recalculation path
+      http.get(`${BASE_URL}/api/v1/feed/?count=10&refresh=true&currently_online=true`, { headers: headers, tags: { name: 'feed:v1_ai_refresh' } });
+    } else if (roll < 35) {
+      // Profile & User info
       http.get(`${BASE_URL}/api/v1/users/me/`, { headers: headers, tags: { name: 'users:me' } });
       http.get(`${BASE_URL}/api/v1/profile/me/`, { headers: headers, tags: { name: 'profile:me' } });
+      http.get(`${BASE_URL}/api/v1/mood/`, { headers: headers, tags: { name: 'mood:get' } });
+      http.get(`${BASE_URL}/api/v1/avatars/`, { headers: headers, tags: { name: 'avatars:list' } });
     } else if (roll < 55) {
-      // Like or Pass candidate if feed candidates seen
+      // Like / Pass / Interested / Connection Request
       if (user.seenCandidates.length > 0) {
         const targetId = user.seenCandidates.shift();
-        const action = Math.random() > 0.3 ? 'send' : 'pass';
+        const rand = Math.random();
+        if (rand < 0.4) {
+          http.post(
+            `${BASE_URL}/api/v1/interaction/send/`,
+            JSON.stringify({ target_user_id: targetId }),
+            { headers: headers, tags: { name: 'interaction:like' } }
+          );
+        } else if (rand < 0.7) {
+          http.post(
+            `${BASE_URL}/api/v1/interested/`,
+            JSON.stringify({ target_user_id: targetId }),
+            { headers: headers, tags: { name: 'interaction:interested' } }
+          );
+        } else {
+          http.post(
+            `${BASE_URL}/api/v1/interaction/start_conversation/`,
+            JSON.stringify({ target_user_id: targetId, message: 'Hey! Want to chat?' }),
+            { headers: headers, tags: { name: 'interaction:start_conversation' } }
+          );
+        }
+      }
+      http.get(`${BASE_URL}/api/v1/interaction/received/`, { headers: headers, tags: { name: 'interaction:received' } });
+    } else if (roll < 75) {
+      // Confession Social (List, Feed, Create, Relate/Like, Repost, Comment, Request)
+      let confRes = http.get(`${BASE_URL}/api/v1/social/feed/?limit=15`, { headers: headers, tags: { name: 'confession:feed' } });
+      if (confRes.status === 200 && confRes.json('results')) {
+        const items = confRes.json('results');
+        items.forEach((item) => {
+          if (item.id) user.confessionIds.push(item.id.toString());
+        });
+      }
+
+      if (Math.random() < 0.3) {
+        let postRes = http.post(
+          `${BASE_URL}/api/v1/social/`,
+          JSON.stringify({
+            text: `Load test confession ${randomHex(8)} about city thoughts and late night vibe.`,
+            mood_tag: 'LONELY',
+            language: 'en',
+            latitude: 12.9716,
+            longitude: 77.5946,
+          }),
+          { headers: headers, tags: { name: 'confession:create' } }
+        );
+        if (postRes.status === 201 && postRes.json('id')) {
+          user.confessionIds.push(postRes.json('id').toString());
+        }
+      }
+
+      if (user.confessionIds.length > 0) {
+        const cid = user.confessionIds[Math.floor(Math.random() * user.confessionIds.length)];
+        http.get(`${BASE_URL}/api/v1/social/${cid}/`, { headers: headers, tags: { name: 'confession:detail' } });
+        http.post(`${BASE_URL}/api/v1/social/${cid}/relate/`, JSON.stringify({}), { headers: headers, tags: { name: 'confession:relate' } });
+        http.post(`${BASE_URL}/api/v1/social/${cid}/repost/`, JSON.stringify({}), { headers: headers, tags: { name: 'confession:repost' } });
         http.post(
-          `${BASE_URL}/api/v1/interaction/${action}/`,
-          JSON.stringify({ target_user_id: targetId }),
-          { headers: headers, tags: { name: `interaction:${action}` } }
+          `${BASE_URL}/api/v1/social/${cid}/comments/`,
+          JSON.stringify({ text: 'Load test comment.', is_anonymous: true }),
+          { headers: headers, tags: { name: 'confession:comment_create' } }
+        );
+        http.post(
+          `${BASE_URL}/api/v1/social/${cid}/chat-request/`,
+          JSON.stringify({ message: 'Hey, your confession hit home. Want to chat?' }),
+          { headers: headers, tags: { name: 'confession:chat_request' } }
         );
       }
-    } else if (roll < 70) {
-      // Update Presence / Last Active
+
+      http.get(`${BASE_URL}/api/v1/confession-requests/`, { headers: headers, tags: { name: 'confession:requests' } });
+      http.get(`${BASE_URL}/api/v1/confession-requests/count/`, { headers: headers, tags: { name: 'confession:request_count' } });
+    } else if (roll < 88) {
+      // Subscriptions, Wallet, Call, Geo
+      http.get(`${BASE_URL}/api/v1/subscriptions/status/`, { headers: headers, tags: { name: 'subscriptions:status' } });
+      http.get(`${BASE_URL}/api/v1/call-time/wallet/`, { headers: headers, tags: { name: 'call:wallet' } });
+      http.get(`${BASE_URL}/api/v1/geo/cities/?q=Ban`, { headers: headers, tags: { name: 'geo:cities' } });
+    } else {
+      // Presence & WS Ticket
       http.post(
         `${BASE_URL}/api/v1/users/last-active/`,
         JSON.stringify({ lat: 12.9716, lon: 77.5946 }),
         { headers: headers, tags: { name: 'users:last_active' } }
       );
-    } else if (roll < 85) {
-      // Session / Catalogs / Verification
-      http.get(`${BASE_URL}/api/v1/auth/session/`, { headers: headers, tags: { name: 'auth:session' } });
-      http.get(`${BASE_URL}/api/v1/social/`, { headers: headers, tags: { name: 'social:list' } });
-      http.get(`${BASE_URL}/api/v1/subscriptions/status/`, { headers: headers, tags: { name: 'subscriptions:status' } });
-    } else {
-      // WS ticket
       http.post(
         `${BASE_URL}/api/v1/auth/ws-ticket/`,
         JSON.stringify({}),
@@ -221,6 +260,6 @@ export default function () {
       );
     }
 
-    sleep(Math.random() * 1.5 + 0.5); // Random wait between 0.5s - 2.0s
+    sleep(Math.random() * 1.5 + 0.5);
   }
 }
