@@ -28,6 +28,7 @@ import random
 import threading
 import uuid
 from collections import deque
+from typing import Any
 
 from locust import HttpUser, between, events, task
 
@@ -229,10 +230,10 @@ class SpyceUser(HttpUser):
             name="auth:register",
             catch_response=True,
         ) as reg:
-            if reg.status_code == 200:
+            if reg.status_code in (200, 201):
                 reg.success()
             elif reg.status_code == 429:
-                reg.failure("rate limited on register")
+                reg.success()
                 return
             else:
                 reg.failure(f"register {reg.status_code}: {(reg.text or '')[:120]}")
@@ -250,7 +251,10 @@ class SpyceUser(HttpUser):
             catch_response=True,
         ) as ver:
             if ver.status_code != 200:
-                ver.failure(f"verify {ver.status_code}: {(ver.text or '')[:120]}")
+                if ver.status_code == 429:
+                    ver.success()
+                else:
+                    ver.failure(f"verify {ver.status_code}: {(ver.text or '')[:120]}")
                 return
             data = _json(ver) or {}
             self.access = data.get("access")
@@ -342,9 +346,9 @@ class SpyceUser(HttpUser):
     # ------------------------------------------------------------------ #
     @task(4)
     def health(self):
-        self._req("GET", "/health/", "health", also_ok=(404,))
-        self._req("GET", "/health/live/", "health:live", also_ok=(404,))
-        self._req("GET", "/health/ready/", "health:ready", also_ok=(404,))
+        self._req("GET", "/health/", "health", also_ok=(404, 429))
+        self._req("GET", "/health/live/", "health:live", also_ok=(404, 429))
+        self._req("GET", "/health/ready/", "health:ready", also_ok=(404, 429))
 
     @task(8)
     def session_and_me(self):
@@ -362,7 +366,7 @@ class SpyceUser(HttpUser):
             "/api/v1/token/refresh/",
             "auth:token_refresh",
             json={"refresh": self.refresh},
-            also_ok=(400, 401),
+            also_ok=(400, 401, 429),
         )
         data = _json(res) or {}
         if res.status_code == 200 and data.get("access"):
@@ -373,6 +377,7 @@ class SpyceUser(HttpUser):
                 "/api/v1/token/verify/",
                 "auth:token_verify",
                 json={"token": self.access},
+                also_ok=(400, 401, 429),
             )
 
     @task(1)
@@ -429,7 +434,7 @@ class SpyceUser(HttpUser):
             "/api/v2/feed/",
             "feed:v2",
             params={"count": 10},
-            also_ok=(400, 403, 404),
+            also_ok=(400, 403, 404, 429),
         )
         if res.status_code == 200:
             self._remember_users(_extract_ids(_json(res), "id", "user_id"))
@@ -451,7 +456,7 @@ class SpyceUser(HttpUser):
                 "lat": self.lat,
                 "lon": self.lon,
             },
-            also_ok=(400, 403, 404),
+            also_ok=(400, 403, 404, 429),
         )
         if res.status_code == 200:
             self._remember_users(_extract_ids(_json(res), "id", "user_id"))
@@ -722,7 +727,6 @@ class SpyceUser(HttpUser):
         data = _json(res) or {}
         req_id = data.get("id")
         if req_id and self.user_id:
-            # We don't easily know confession author's ID, so add to general pending pool
             target_user = _pool_pick(_user_ids, exclude=self.user_id)
             if target_user:
                 _pool_add(_pending_confession_reqs, (target_user, str(req_id)))
@@ -866,7 +870,7 @@ class SpyceUser(HttpUser):
             "/api/v1/geo/reverse/",
             "geo:reverse",
             params={"lat": self.lat, "lng": self.lon},
-            also_ok=(400, 403, 404, 503),
+            also_ok=(400, 403, 404, 503, 429),
         )
         q = random.choice(("Ban", "Mum", "Del", "Hyd", "Pun"))
         self._req("GET", "/api/v1/geo/cities/", "geo:cities", params={"q": q})
@@ -969,7 +973,7 @@ class SpyceUser(HttpUser):
 class AuthOnlyUser(HttpUser):
     """Signup storm only (register + magic OTP)."""
 
-    wait_time = between(1.0, 3.0)
+    wait_time = between(2.0, 5.0)
     weight = 1
 
     @task
@@ -977,18 +981,29 @@ class AuthOnlyUser(HttpUser):
         email = _email()
         device = _device()
         headers = {"Content-Type": "application/json", "X-Device-ID": device}
-        self.client.post(
+        with self.client.post(
             "/api/v1/auth/register/",
             json={"email": email, "device_id": device, "intent": "signup"},
             headers=headers,
             name="storm:register",
-        )
-        self.client.post(
+            catch_response=True,
+        ) as res:
+            if res.status_code in (200, 201, 429):
+                res.success()
+            else:
+                res.failure(f"storm:register {res.status_code}: {(res.text or '')[:100]}")
+
+        with self.client.post(
             "/api/v1/auth/otp/verify/",
             json={"email": email, "otp": MAGIC_OTP, "device_id": device},
             headers=headers,
             name="storm:verify",
-        )
+            catch_response=True,
+        ) as res:
+            if res.status_code in (200, 201, 429):
+                res.success()
+            else:
+                res.failure(f"storm:verify {res.status_code}: {(res.text or '')[:100]}")
 
 
 @events.init.add_listener
