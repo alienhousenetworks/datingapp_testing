@@ -176,8 +176,8 @@ export default function () {
       // Health check
       http.get(`${BASE_URL}/health/`, { tags: { name: 'health' } });
     } else if (roll < 25) {
-      // Discovery feed
-      let feedRes = http.get(`${BASE_URL}/api/v1/feed/?count=10`, { headers: headers, tags: { name: 'feed:list' } });
+      // Discovery feed (FastAPI v2)
+      let feedRes = http.get(`${BASE_URL}/api/v2/feed/?count=10`, { headers: headers, tags: { name: 'feed:list' } });
       if (feedRes.status === 200 && feedRes.json('results')) {
         const items = feedRes.json('results');
         items.forEach((item) => {

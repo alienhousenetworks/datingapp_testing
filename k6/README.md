@@ -8,7 +8,7 @@ This directory contains standalone JavaScript load testing scripts for **k6**, t
 
 The k6 scripts perform non-stop active application requests across all core features:
 
-1. **Feed Discovery**: `GET /api/v1/feed/?count=10`
+1. **Feed Discovery (FastAPI v2)**: `GET /api/v2/feed/?count=10`
 2. **Confessions & Social**: `GET /api/v1/social/` (Feed) & `POST /api/v1/social/` (Create Confession Post)
 3. **Interactions**: `POST /api/v1/interaction/send/` (Like) & `POST /api/v1/interaction/pass/` (Pass)
 4. **Matches & Messaging**: `GET /api/v1/matches/` & `GET /api/v1/conversations/`

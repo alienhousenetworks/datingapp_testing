@@ -91,8 +91,8 @@ export default function (data) {
   const choice = Math.random();
 
   if (choice < 0.25) {
-    // 1. DISCOVERY FEED REQUESTS (25%) - LRANGE Redis Feed cache
-    let feedRes = http.get(`${BASE_URL}/api/v1/feed/?count=10`, { headers: headers, tags: { name: 'feed:list' } });
+    // 1. DISCOVERY FEED REQUESTS (25%) - FastAPI v2 Async Feed (Redis pool + card mget)
+    let feedRes = http.get(`${BASE_URL}/api/v2/feed/?count=10`, { headers: headers, tags: { name: 'feed:list' } });
     check(feedRes, { 'feed status 200/304': (r) => r.status === 200 || r.status === 304 });
 
   } else if (choice < 0.45) {
