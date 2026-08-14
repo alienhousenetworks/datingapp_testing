@@ -34,10 +34,26 @@ Or:
 
 ## User classes
 
-| Class | Behavior |
-|-------|----------|
-| `SpyceUser` | Full session: magic OTP signup → mock face → feed/me/heartbeat loop |
-| `AuthOnlyUser` | Auth storm only (register + verify) |
+| Class | Weight | Behavior |
+|-------|--------|----------|
+| `SpyceUser` | 10 | Full session: magic OTP signup → mock face → complete profile → loop every client API |
+| `AuthOnlyUser` | 1 | Auth storm only (register + verify) |
+
+`SpyceUser` hits the real product paths, not just onboarding:
+
+| Area | Requests |
+|------|----------|
+| Feed | `GET /api/v1/feed/`, `GET /api/v2/feed/` |
+| Likes / match | `POST /interaction/send/`, `/pass/`, `/interested/`, `GET /received/`, `GET /matches/` |
+| Chat | `GET /conversations/`, `GET /messages/`, `POST /messages/` |
+| Confessions | list, geo feed, create, relate, repost, comments, chat-request |
+| Profile | `GET/PATCH /profile/me/`, `GET /profile/{id}/`, username check, avatars, mood |
+| Presence / geo | `POST /users/last-active/`, reverse + city autocomplete |
+| Catalogs / theme | genders, sexualities, intents, turn_ons, moods, languages, theme |
+| Wallet / calls | subscription status, ICE servers, call quota/wallet |
+| Other | session, token refresh, WS ticket, analytics, verification, blocks |
+
+Virtual users share a pool of IDs so likes can land on other load-test users and produce matches.
 
 ## Notes
 

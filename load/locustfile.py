@@ -1,7 +1,11 @@
 """
-Locust load tests for SPYCE backend.
+Locust load tests for the SPYCE dating API.
 
-Assumes:
+Each virtual user signs up (magic OTP), completes onboarding, then loops
+across the real client surfaces: feed, like/pass/match, chat, confessions,
+profile, presence, catalogs, geo, theme, wallet, calls, analytics.
+
+Assumes the target has:
   DISABLE_RATE_LIMITING=True
   USE_TEST_OTP=True, MAGIC_OTP=123456
   REQUIRE_CAPTCHA=False
@@ -9,18 +13,37 @@ Assumes:
 
 Run:
   locust -f load/locustfile.py --host http://127.0.0.1:8000
-  # headless:
-  locust -f load/locustfile.py --host http://127.0.0.1:8000 \
-    --users 20 --spawn-rate 5 --run-time 60s --headless
+  locust -f load/locustfile.py --host https://api01.spycenow.com \\
+    --users 50 --spawn-rate 5 --run-time 3m --headless
 """
 from __future__ import annotations
 
 import os
+import random
+import threading
 import uuid
+from collections import deque
 
 from locust import HttpUser, between, events, task
 
 MAGIC_OTP = os.getenv("MAGIC_OTP", "123456")
+LAT = float(os.getenv("LOAD_LAT", "12.9716"))
+LON = float(os.getenv("LOAD_LON", "77.5946"))
+
+# Shared across VUs so likes can land on other load-test users and create matches.
+_lock = threading.Lock()
+_user_ids: deque[str] = deque(maxlen=800)
+_feed_ids: deque[str] = deque(maxlen=800)
+_confession_ids: deque[str] = deque(maxlen=400)
+
+MOOD_TAGS = (
+    "LONELY",
+    "CURIOUS",
+    "HAPPY",
+    "ANXIOUS",
+    "GRATEFUL",
+    "FANTASY",
+)
 
 
 def _email() -> str:
@@ -31,10 +54,81 @@ def _device() -> str:
     return f"load-device-{uuid.uuid4()}"
 
 
-class SpyceUser(HttpUser):
-    """Simulated dating app client: auth → onboarding → me → feed → interactions loop."""
+def _jitter_coords() -> tuple[float, float]:
+    return (
+        round(LAT + random.uniform(-0.04, 0.04), 6),
+        round(LON + random.uniform(-0.04, 0.04), 6),
+    )
 
-    wait_time = between(0.5, 2.0)
+
+def _pool_add(pool: deque[str], value: str | None) -> None:
+    if not value:
+        return
+    value = str(value)
+    with _lock:
+        if value not in pool:
+            pool.append(value)
+
+
+def _pool_pick(pool: deque[str], exclude: str | None = None) -> str | None:
+    with _lock:
+        choices = [x for x in pool if x and x != exclude]
+    return random.choice(choices) if choices else None
+
+
+def _json(res):
+    try:
+        return res.json()
+    except Exception:
+        return None
+
+
+def _as_items(data) -> list:
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("results", "users", "data", "items"):
+        val = data.get(key)
+        if isinstance(val, list):
+            return val
+    return []
+
+
+def _extract_ids(data, *keys: str) -> list[str]:
+    ids: list[str] = []
+    for item in _as_items(data):
+        if not isinstance(item, dict):
+            continue
+        for key in keys:
+            val = item.get(key)
+            if isinstance(val, dict):
+                val = val.get("id") or val.get("user_id")
+            if val:
+                ids.append(str(val))
+                break
+        profile = item.get("profile") or item.get("profile_card") or {}
+        if isinstance(profile, dict):
+            nested = profile.get("user_id") or profile.get("id")
+            if nested:
+                ids.append(str(nested))
+    # preserve order, drop dups
+    seen: set[str] = set()
+    out: list[str] = []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+class SpyceUser(HttpUser):
+    """Full app session: onboard once, then hit every client API."""
+
+    wait_time = between(0.3, 1.2)
+    weight = 10
 
     def on_start(self):
         self.email = _email()
@@ -42,8 +136,16 @@ class SpyceUser(HttpUser):
         self.access = None
         self.refresh = None
         self.user_id = None
-        self.seen_candidates: list[str] = []
-        self._authenticate()
+        self.username = f"usr_{uuid.uuid4().hex[:12]}"
+        self.lat, self.lon = _jitter_coords()
+        self.gender_id = 1
+        self.sexuality_id = 1
+        self.mood_ids: list = []
+        self.seen_candidates: deque[str] = deque(maxlen=80)
+        self.confession_ids: deque[str] = deque(maxlen=40)
+        self.match_ids: deque[str] = deque(maxlen=20)
+        self.conversation_ids: deque[str] = deque(maxlen=20)
+        self._authenticate_and_onboard()
 
     def _headers(self) -> dict:
         h = {
@@ -55,8 +157,44 @@ class SpyceUser(HttpUser):
             h["Authorization"] = f"Bearer {self.access}"
         return h
 
-    def _authenticate(self):
-        # 1. Register (OTP request)
+    def _req(
+        self,
+        method: str,
+        path: str,
+        name: str,
+        expected: tuple[int, ...] = (200, 201, 204, 304),
+        also_ok: tuple[int, ...] = (400, 403, 404, 409, 429),
+        **kwargs,
+    ):
+        kwargs.setdefault("headers", self._headers())
+        with self.client.request(
+            method,
+            path,
+            name=name,
+            catch_response=True,
+            **kwargs,
+        ) as res:
+            if res.status_code in expected or res.status_code in also_ok:
+                res.success()
+            else:
+                body = (res.text or "")[:120]
+                res.failure(f"{name} {res.status_code}: {body}")
+        return res
+
+    def _remember_users(self, ids: list[str]) -> None:
+        for uid in ids:
+            if uid == self.user_id:
+                continue
+            if uid not in self.seen_candidates:
+                self.seen_candidates.append(uid)
+            _pool_add(_feed_ids, uid)
+
+    def _pick_target(self) -> str | None:
+        if self.seen_candidates:
+            return self.seen_candidates.popleft()
+        return _pool_pick(_feed_ids, self.user_id) or _pool_pick(_user_ids, self.user_id)
+
+    def _authenticate_and_onboard(self):
         with self.client.post(
             "/api/v1/auth/register/",
             json={
@@ -74,10 +212,9 @@ class SpyceUser(HttpUser):
                 reg.failure("rate limited on register")
                 return
             else:
-                reg.failure(f"register {reg.status_code}: {reg.text[:120]}")
+                reg.failure(f"register {reg.status_code}: {(reg.text or '')[:120]}")
                 return
 
-        # 2. Verify OTP
         with self.client.post(
             "/api/v1/auth/otp/verify/",
             json={
@@ -90,180 +227,481 @@ class SpyceUser(HttpUser):
             catch_response=True,
         ) as ver:
             if ver.status_code != 200:
-                ver.failure(f"verify {ver.status_code}: {ver.text[:120]}")
+                ver.failure(f"verify {ver.status_code}: {(ver.text or '')[:120]}")
                 return
-            data = ver.json()
+            data = _json(ver) or {}
             self.access = data.get("access")
             self.refresh = data.get("refresh")
             self.user_id = str(data.get("user_id") or "")
             if not self.access:
                 ver.failure("no access token")
                 return
-            else:
-                ver.success()
+            ver.success()
 
-        # 3. Face mock verification (FACE_VERIFICATION=False)
-        self.client.post(
+        self._req(
+            "POST",
             "/api/v1/verification/mock-complete/",
+            "verification:mock_complete",
             json={},
-            headers=self._headers(),
-            name="verification:mock_complete",
         )
 
-        # 4. Fetch option catalogs to find valid gender & sexuality IDs
-        gender_id = 1
-        sexuality_id = 1
+        g_res = self._req("GET", "/api/v1/genders/", "options:genders_onboarding")
+        g_list = _json(g_res)
+        if isinstance(g_list, list) and g_list:
+            self.gender_id = g_list[0].get("id", 1)
 
-        g_res = self.client.get(
-            "/api/v1/genders/",
-            headers=self._headers(),
-            name="options:genders_onboarding",
+        s_res = self._req("GET", "/api/v1/sexualities/", "options:sexualities_onboarding")
+        s_list = _json(s_res)
+        if isinstance(s_list, list) and s_list:
+            self.sexuality_id = s_list[0].get("id", 1)
+
+        m_res = self._req("GET", "/api/v1/mood_options/", "options:moods_onboarding")
+        m_list = _json(m_res)
+        if isinstance(m_list, list):
+            self.mood_ids = [m.get("id") for m in m_list[:2] if m.get("id")]
+
+        self._req(
+            "GET",
+            f"/api/v1/profile/username-available/?username={self.username}",
+            "profile:username_available",
         )
-        if g_res.status_code == 200:
-            try:
-                g_list = g_res.json()
-                if isinstance(g_list, list) and len(g_list) > 0:
-                    gender_id = g_list[0].get("id", 1)
-            except Exception:
-                pass
 
-        s_res = self.client.get(
-            "/api/v1/sexualities/",
-            headers=self._headers(),
-            name="options:sexualities_onboarding",
-        )
-        if s_res.status_code == 200:
-            try:
-                s_list = s_res.json()
-                if isinstance(s_list, list) and len(s_list) > 0:
-                    sexuality_id = s_list[0].get("id", 1)
-            except Exception:
-                pass
-
-        # 5. Populate profile onboarding details (sets is_discoverable = True)
-        username = f"usr_{uuid.uuid4().hex[:12]}"
-        onboarding_payload = {
-            "username": username,
-            "name": f"User {username[:6]}",
-            "date_of_birth": "1998-05-15",
-            "gender": gender_id,
-            "sexuality": sexuality_id,
-            "preferred_genders": [gender_id],
-            "bio": "Load testing user profile with complete details for discovery feed testing.",
-            "latitude": 12.9716,
-            "longitude": 77.5946,
-        }
-        self.client.patch(
+        self._req(
+            "PATCH",
             "/api/v1/profile/me/",
-            json=onboarding_payload,
-            headers=self._headers(),
-            name="profile:onboarding_patch",
+            "profile:onboarding_patch",
+            json={
+                "username": self.username,
+                "name": f"User {self.username[:6]}",
+                "date_of_birth": "1998-05-15",
+                "gender": self.gender_id,
+                "sexuality": self.sexuality_id,
+                "preferred_genders": [self.gender_id],
+                "bio": "Load testing user. Complete profile so Discover and likes work.",
+                "latitude": self.lat,
+                "longitude": self.lon,
+            },
         )
 
-        # 6. Initialize presence & location in Redis
-        self.client.post(
+        if self.mood_ids:
+            self._req(
+                "POST",
+                "/api/v1/mood/",
+                "mood:set_onboarding",
+                json={"mood_ids": self.mood_ids},
+            )
+
+        self._req(
+            "POST",
             "/api/v1/users/last-active/",
-            json={"lat": 12.9716, "lon": 77.5946},
-            headers=self._headers(),
-            name="users:last_active_init",
+            "users:last_active_init",
+            json={"lat": self.lat, "lon": self.lon},
         )
+        self._req("GET", "/api/v1/users/dpdp-consent/", "users:dpdp_get")
+        self._req(
+            "POST",
+            "/api/v1/users/dpdp-consent/",
+            "users:dpdp_post",
+            json={
+                "consent_version": "1.0",
+                "notice_language": "en",
+                "matchmaking_consent": True,
+                "location_processing_consent": True,
+                "sensitive_data_consent": True,
+                "marketing_consent": False,
+            },
+        )
+        if self.user_id:
+            _pool_add(_user_ids, self.user_id)
 
-    @task(5)
+    # ------------------------------------------------------------------ #
+    # Health / session
+    # ------------------------------------------------------------------ #
+    @task(4)
     def health(self):
-        self.client.get("/health/", name="health")
-
-    @task(10)
-    def users_me(self):
-        if not self.access:
-            return
-        self.client.get("/api/v1/users/me/", headers=self._headers(), name="users:me")
+        self._req("GET", "/health/", "health", also_ok=(404,))
+        self._req("GET", "/health/live/", "health:live", also_ok=(404,))
+        self._req("GET", "/health/ready/", "health:ready", also_ok=(404,))
 
     @task(8)
-    def session(self):
+    def session_and_me(self):
         if not self.access:
             return
-        self.client.get(
-            "/api/v1/auth/session/",
-            headers=self._headers(),
-            name="auth:session",
-        )
-
-    @task(15)
-    def feed(self):
-        if not self.access:
-            return
-        res = self.client.get(
-            "/api/v1/feed/",
-            params={"count": 10},
-            headers=self._headers(),
-            name="feed:list",
-        )
-        if res.status_code == 200:
-            try:
-                data = res.json()
-                results = data.get("results") or []
-                for item in results:
-                    cand_id = item.get("id") or item.get("user_id")
-                    if cand_id and str(cand_id) not in self.seen_candidates:
-                        self.seen_candidates.append(str(cand_id))
-            except Exception:
-                pass
-
-    @task(5)
-    def like_candidate(self):
-        if not self.access or not self.seen_candidates:
-            return
-        target_id = self.seen_candidates.pop(0)
-        self.client.post(
-            "/api/v1/interaction/send/",
-            json={"target_user_id": target_id},
-            headers=self._headers(),
-            name="interaction:like",
-        )
-
-    @task(3)
-    def pass_candidate(self):
-        if not self.access or not self.seen_candidates:
-            return
-        target_id = self.seen_candidates.pop(0)
-        self.client.post(
-            "/api/v1/interaction/pass/",
-            json={"target_user_id": target_id},
-            headers=self._headers(),
-            name="interaction:pass",
-        )
+        self._req("GET", "/api/v1/users/me/", "users:me")
+        self._req("GET", "/api/v1/auth/session/", "auth:session")
 
     @task(2)
-    def received_likes(self):
+    def token_refresh(self):
+        if not self.refresh:
+            return
+        res = self._req(
+            "POST",
+            "/api/v1/token/refresh/",
+            "auth:token_refresh",
+            json={"refresh": self.refresh},
+            also_ok=(400, 401),
+        )
+        data = _json(res) or {}
+        if res.status_code == 200 and data.get("access"):
+            self.access = data["access"]
+        if self.access:
+            self._req(
+                "POST",
+                "/api/v1/token/verify/",
+                "auth:token_verify",
+                json={"token": self.access},
+            )
+
+    @task(1)
+    def ws_ticket(self):
         if not self.access:
             return
-        self.client.get(
-            "/api/v1/interaction/received/",
-            headers=self._headers(),
-            name="interaction:received",
+        self._req("POST", "/api/v1/auth/ws-ticket/", "auth:ws_ticket", json={})
+
+    # ------------------------------------------------------------------ #
+    # Feed (Django v1 + FastAPI v2)
+    # ------------------------------------------------------------------ #
+    @task(18)
+    def feed_v1(self):
+        if not self.access:
+            return
+        res = self._req(
+            "GET",
+            "/api/v1/feed/",
+            "feed:v1",
+            params={"count": 10, "cursor": 0},
         )
+        if res.status_code == 200:
+            self._remember_users(_extract_ids(_json(res), "id", "user_id"))
+
+    @task(12)
+    def feed_v2(self):
+        if not self.access:
+            return
+        res = self._req(
+            "GET",
+            "/api/v2/feed/",
+            "feed:v2",
+            params={"count": 10},
+            also_ok=(400, 403, 404),
+        )
+        if res.status_code == 200:
+            self._remember_users(_extract_ids(_json(res), "id", "user_id"))
+
+    # ------------------------------------------------------------------ #
+    # Likes / pass / incoming / interested
+    # ------------------------------------------------------------------ #
+    @task(12)
+    def like_candidate(self):
+        if not self.access:
+            return
+        target = self._pick_target()
+        if not target:
+            return
+        res = self._req(
+            "POST",
+            "/api/v1/interaction/send/",
+            "interaction:like",
+            json={"target_user_id": target},
+        )
+        data = _json(res) or {}
+        if data.get("status") == "match" or data.get("match_id"):
+            if data.get("match_id"):
+                self.match_ids.append(str(data["match_id"]))
+            if data.get("conversation_id"):
+                self.conversation_ids.append(str(data["conversation_id"]))
 
     @task(6)
-    def last_active(self):
+    def interested(self):
         if not self.access:
             return
-        self.client.post(
-            "/api/v1/users/last-active/",
-            json={"lat": 12.9716, "lon": 77.5946},
-            headers=self._headers(),
-            name="users:last_active",
+        target = self._pick_target()
+        if not target:
+            return
+        self._req(
+            "POST",
+            "/api/v1/interested/",
+            "interaction:interested",
+            json={"target_user_id": target},
+        )
+
+    @task(5)
+    def pass_candidate(self):
+        if not self.access:
+            return
+        target = self._pick_target()
+        if not target:
+            return
+        self._req(
+            "POST",
+            "/api/v1/interaction/pass/",
+            "interaction:pass",
+            json={"target_user_id": target},
         )
 
     @task(4)
+    def received_likes(self):
+        if not self.access:
+            return
+        res = self._req("GET", "/api/v1/interaction/received/", "interaction:received")
+        if res.status_code == 200:
+            self._remember_users(_extract_ids(_json(res), "id", "user_id"))
+
+    @task(2)
+    def start_conversation_request(self):
+        if not self.access:
+            return
+        target = self._pick_target()
+        if not target:
+            return
+        self._req(
+            "POST",
+            "/api/v1/interaction/start_conversation/",
+            "interaction:start_conversation",
+            json={
+                "target_user_id": target,
+                "message": "Hey, saw you on Discover — want to chat?",
+            },
+        )
+
+    # ------------------------------------------------------------------ #
+    # Matches + chat
+    # ------------------------------------------------------------------ #
+    @task(6)
+    def matches(self):
+        if not self.access:
+            return
+        res = self._req("GET", "/api/v1/matches/", "matches:list")
+        if res.status_code != 200:
+            return
+        data = _json(res)
+        for mid in _extract_ids(data, "id"):
+            if mid not in self.match_ids:
+                self.match_ids.append(mid)
+        items = _as_items(data)
+        for item in items[:3]:
+            if not isinstance(item, dict):
+                continue
+            pk = item.get("id")
+            if pk:
+                self._req("GET", f"/api/v1/matches/{pk}/", "matches:detail")
+
+    @task(6)
+    def conversations(self):
+        if not self.access:
+            return
+        res = self._req("GET", "/api/v1/conversations/", "conversations:list")
+        if res.status_code != 200:
+            return
+        data = _json(res)
+        ids = _extract_ids(data, "id")
+        for cid in ids:
+            if cid not in self.conversation_ids:
+                self.conversation_ids.append(cid)
+        if not ids:
+            return
+        conv_id = ids[0]
+        self._req("GET", f"/api/v1/conversations/{conv_id}/", "conversations:detail")
+        self._req(
+            "GET",
+            "/api/v1/messages/",
+            "messages:list",
+            params={"conversation_id": conv_id},
+        )
+        self._req(
+            "GET",
+            f"/api/v1/conversations/{conv_id}/draft/",
+            "conversations:draft_get",
+        )
+
+    @task(3)
+    def send_chat_message(self):
+        if not self.access or not self.conversation_ids:
+            return
+        conv_id = self.conversation_ids[0]
+        self._req(
+            "POST",
+            "/api/v1/messages/",
+            "messages:send",
+            json={
+                "conversation": conv_id,
+                "content": f"load msg {uuid.uuid4().hex[:8]}",
+                "message_type": "text",
+            },
+        )
+
+    # ------------------------------------------------------------------ #
+    # Confessions / social
+    # ------------------------------------------------------------------ #
+    @task(8)
+    def confession_list(self):
+        if not self.access:
+            return
+        res = self._req("GET", "/api/v1/social/", "confession:list")
+        self._store_confessions(res)
+
+    @task(8)
+    def confession_feed(self):
+        if not self.access:
+            return
+        res = self._req(
+            "GET",
+            "/api/v1/social/feed/",
+            "confession:feed",
+            params={"lat": self.lat, "lng": self.lon, "limit": 20},
+        )
+        self._store_confessions(res)
+
+    @task(3)
+    def confession_create(self):
+        if not self.access:
+            return
+        text = (
+            f"Load-test confession {uuid.uuid4().hex[:8]} about late-night "
+            f"thoughts and city lights. This must be at least thirty chars."
+        )
+        res = self._req(
+            "POST",
+            "/api/v1/social/",
+            "confession:create",
+            json={
+                "text": text,
+                "mood_tag": random.choice(MOOD_TAGS),
+                "language": "en",
+                "latitude": self.lat,
+                "longitude": self.lon,
+            },
+        )
+        data = _json(res) or {}
+        cid = data.get("id")
+        if cid:
+            self.confession_ids.appendleft(str(cid))
+            _pool_add(_confession_ids, str(cid))
+
+    @task(4)
+    def confession_engage(self):
+        if not self.access:
+            return
+        cid = None
+        if self.confession_ids:
+            cid = self.confession_ids[0]
+        else:
+            cid = _pool_pick(_confession_ids)
+        if not cid:
+            return
+        self._req("GET", f"/api/v1/social/{cid}/", "confession:detail")
+        self._req("POST", f"/api/v1/social/{cid}/relate/", "confession:relate", json={})
+        if random.random() < 0.35:
+            self._req("POST", f"/api/v1/social/{cid}/repost/", "confession:repost", json={})
+        if random.random() < 0.4:
+            self._req(
+                "POST",
+                f"/api/v1/social/{cid}/comments/",
+                "confession:comment",
+                json={"text": "Relatable load-test comment.", "is_anonymous": True},
+            )
+        else:
+            self._req("GET", f"/api/v1/social/{cid}/comments/", "confession:comments")
+
+    @task(1)
+    def confession_chat_request(self):
+        if not self.access:
+            return
+        cid = _pool_pick(_confession_ids) or (
+            self.confession_ids[0] if self.confession_ids else None
+        )
+        if not cid:
+            return
+        self._req(
+            "POST",
+            f"/api/v1/social/{cid}/chat-request/",
+            "confession:chat_request",
+            json={"message": "Hey, your confession hit hard. Want to talk?"},
+        )
+
+    @task(2)
+    def confession_requests(self):
+        if not self.access:
+            return
+        self._req("GET", "/api/v1/social/moods/", "confession:moods")
+        self._req("GET", "/api/v1/confession-requests/", "confession:requests")
+        self._req("GET", "/api/v1/confession-requests/count/", "confession:request_count")
+
+    def _store_confessions(self, res) -> None:
+        if res.status_code != 200:
+            return
+        for cid in _extract_ids(_json(res), "id"):
+            if cid not in self.confession_ids:
+                self.confession_ids.append(cid)
+            _pool_add(_confession_ids, cid)
+
+    # ------------------------------------------------------------------ #
+    # Profile
+    # ------------------------------------------------------------------ #
+    @task(8)
     def profile_me(self):
         if not self.access:
             return
-        self.client.get(
+        self._req("GET", "/api/v1/profile/me/", "profile:me")
+
+    @task(3)
+    def profile_update(self):
+        if not self.access:
+            return
+        self.lat, self.lon = _jitter_coords()
+        self._req(
+            "PATCH",
             "/api/v1/profile/me/",
-            headers=self._headers(),
-            name="profile:me",
+            "profile:patch",
+            json={
+                "bio": f"Updated bio {uuid.uuid4().hex[:6]} for load testing.",
+                "latitude": self.lat,
+                "longitude": self.lon,
+            },
         )
 
+    @task(4)
+    def profile_other(self):
+        if not self.access:
+            return
+        target = self._pick_target()
+        if not target:
+            return
+        self._req("GET", f"/api/v1/profile/{target}/", "profile:other")
+
+    @task(2)
+    def profile_username_check(self):
+        if not self.access:
+            return
+        self._req(
+            "GET",
+            f"/api/v1/profile/username-available/?username=load_{uuid.uuid4().hex[:8]}",
+            "profile:username_available",
+        )
+
+    @task(2)
+    def images_and_avatars(self):
+        if not self.access:
+            return
+        self._req("GET", "/api/v1/images/upload-status/", "images:upload_status")
+        self._req("GET", "/api/v1/avatars/", "avatars:list")
+
+    @task(2)
+    def mood(self):
+        if not self.access:
+            return
+        self._req("GET", "/api/v1/mood/", "mood:get")
+        if self.mood_ids:
+            self._req(
+                "POST",
+                "/api/v1/mood/",
+                "mood:set",
+                json={"mood_ids": self.mood_ids[:1]},
+            )
+
+    # ------------------------------------------------------------------ #
+    # Catalogs / theme / geo
+    # ------------------------------------------------------------------ #
     @task(3)
     def option_catalogs(self):
         if not self.access:
@@ -274,56 +712,130 @@ class SpyceUser(HttpUser):
             ("/api/v1/sexualities/", "options:sexualities"),
             ("/api/v1/turn_ons/", "options:turn_ons"),
             ("/api/v1/mood_options/", "options:mood_options"),
+            ("/api/v1/languages/", "options:languages"),
         ):
-            self.client.get(path, headers=self._headers(), name=name)
+            self._req("GET", path, name)
 
     @task(2)
-    def confessions(self):
+    def theme(self):
         if not self.access:
             return
-        self.client.get(
-            "/api/v1/social/",
-            headers=self._headers(),
-            name="social:list",
+        self._req("GET", "/api/v1/theme/options/", "theme:options")
+        self._req("GET", "/api/v1/theme/me/", "theme:me")
+
+    @task(2)
+    def geo(self):
+        if not self.access:
+            return
+        self._req(
+            "GET",
+            "/api/v1/geo/reverse/",
+            "geo:reverse",
+            params={"lat": self.lat, "lng": self.lon},
+            also_ok=(400, 403, 404, 503),
         )
+        q = random.choice(("Ban", "Mum", "Del", "Hyd", "Pun"))
+        self._req("GET", "/api/v1/geo/cities/", "geo:cities", params={"q": q})
+        self._req("GET", "/api/v1/geo/autocomplete/", "geo:autocomplete", params={"q": q})
 
-    @task(2)
-    def verification_status(self):
+    # ------------------------------------------------------------------ #
+    # Presence / devices / notifications
+    # ------------------------------------------------------------------ #
+    @task(6)
+    def last_active(self):
         if not self.access:
             return
-        self.client.get(
-            "/api/v1/verification/status/",
-            headers=self._headers(),
-            name="verification:status",
-        )
-
-    @task(2)
-    def subscription_status(self):
-        if not self.access:
-            return
-        self.client.get(
-            "/api/v1/subscriptions/status/",
-            headers=self._headers(),
-            name="subscriptions:status",
+        self.lat, self.lon = _jitter_coords()
+        self._req(
+            "POST",
+            "/api/v1/users/last-active/",
+            "users:last_active",
+            json={"lat": self.lat, "lon": self.lon},
         )
 
     @task(1)
-    def ws_ticket(self):
+    def devices_and_push(self):
         if not self.access:
             return
-        self.client.post(
-            "/api/v1/auth/ws-ticket/",
-            json={},
-            headers=self._headers(),
-            name="auth:ws_ticket",
+        self._req("GET", "/api/v1/users/devices/", "users:devices")
+        self._req(
+            "POST",
+            "/api/v1/notifications/devices/",
+            "notifications:register",
+            json={
+                "fcm_token": f"load-fcm-{self.device_id}",
+                "device_type": "ANDROID",
+            },
         )
+
+    # ------------------------------------------------------------------ #
+    # Wallet / subscriptions / calls
+    # ------------------------------------------------------------------ #
+    @task(2)
+    def subscriptions(self):
+        if not self.access:
+            return
+        self._req("GET", "/api/v1/subscriptions/status/", "subscriptions:status")
+        self._req("GET", "/api/v1/subscriptions/history/", "subscriptions:history")
+        self._req("GET", "/api/v1/subscriptions/required-plan/", "subscriptions:required_plan")
+        self._req("GET", "/api/v1/subscription/me/", "wallet:subscription_me")
+
+    @task(2)
+    def call_and_wallet(self):
+        if not self.access:
+            return
+        self._req("GET", "/api/v1/call/ice-servers/", "call:ice_servers")
+        self._req("GET", "/api/v1/call/quota/", "call:quota")
+        self._req("GET", "/api/v1/call-time/wallet/", "call:wallet")
+        self._req("GET", "/api/v1/call-time/packages/", "call:packages")
+
+    # ------------------------------------------------------------------ #
+    # Analytics / verification / moderation reads
+    # ------------------------------------------------------------------ #
+    @task(2)
+    def analytics_event(self):
+        if not self.access:
+            return
+        self._req(
+            "POST",
+            "/api/v1/analytics/events/",
+            "analytics:event",
+            json={
+                "event_name": "feed_view",
+                "properties": {"source": "locust"},
+                "session_id": self.device_id[:32],
+                "device_type": "android",
+                "platform": "android",
+                "app_version": "load-1",
+            },
+        )
+        self._req(
+            "POST",
+            "/api/v1/events/bulk/",
+            "analytics:bulk",
+            json={
+                "events": [
+                    {
+                        "type": "heartbeat",
+                        "data": {"lat": self.lat, "lon": self.lon},
+                    }
+                ]
+            },
+        )
+
+    @task(1)
+    def verification_and_blocks(self):
+        if not self.access:
+            return
+        self._req("GET", "/api/v1/verification/status/", "verification:status")
+        self._req("GET", "/api/v1/moderation/blocks/", "moderation:blocks")
 
 
 class AuthOnlyUser(HttpUser):
-    """Hammer auth endpoints only (signup storm with magic OTP)."""
+    """Signup storm only (register + magic OTP)."""
 
     wait_time = between(1.0, 3.0)
-    weight = 1  # lower relative weight if mixed
+    weight = 1
 
     @task
     def signup_flow(self):
@@ -348,7 +860,6 @@ class AuthOnlyUser(HttpUser):
 def on_locust_init(environment, **kwargs):
     print(
         f"[SPYCE load] MAGIC_OTP={MAGIC_OTP} | "
-        "bot=off (no captcha) | face=mock | host="
-        f"{getattr(environment, 'host', None)}"
+        "full API (feed/like/match/confession/profile) | "
+        f"host={getattr(environment, 'host', None)}"
     )
-
