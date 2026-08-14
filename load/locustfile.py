@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import random
 import threading
+import time
 import uuid
 from collections import deque
 from typing import Any
@@ -218,52 +219,66 @@ class SpyceUser(HttpUser):
             return self.seen_candidates.popleft()
         return _pool_pick(_feed_ids, self.user_id) or _pool_pick(_user_ids, self.user_id)
 
-    def _authenticate_and_onboard(self):
-        with self.client.post(
-            "/api/v1/auth/register/",
-            json={
-                "email": self.email,
-                "device_id": self.device_id,
-                "intent": "signup",
-            },
-            headers=self._headers(),
-            name="auth:register",
-            catch_response=True,
-        ) as reg:
-            if reg.status_code in (200, 201):
-                reg.success()
-            elif reg.status_code == 429:
-                reg.success()
-                return
-            else:
-                reg.failure(f"register {reg.status_code}: {(reg.text or '')[:120]}")
-                return
+    def _ensure_auth(self) -> bool:
+        if self.access:
+            return True
+        self._authenticate_and_onboard()
+        return self.access is not None
 
-        with self.client.post(
-            "/api/v1/auth/otp/verify/",
-            json={
-                "email": self.email,
-                "otp": MAGIC_OTP,
-                "device_id": self.device_id,
-            },
-            headers=self._headers(),
-            name="auth:otp_verify",
-            catch_response=True,
-        ) as ver:
-            if ver.status_code != 200:
+    def _authenticate_and_onboard(self):
+        # Retry authentication if rate-limited during high-concurrency spawn
+        for attempt in range(3):
+            with self.client.post(
+                "/api/v1/auth/register/",
+                json={
+                    "email": self.email,
+                    "device_id": self.device_id,
+                    "intent": "signup",
+                },
+                headers=self._headers(),
+                name="auth:register",
+                catch_response=True,
+            ) as reg:
+                if reg.status_code in (200, 201):
+                    reg.success()
+                elif reg.status_code == 429:
+                    reg.success()
+                    time.sleep(0.5)
+                    continue
+                else:
+                    reg.failure(f"register {reg.status_code}: {(reg.text or '')[:120]}")
+                    return
+
+            with self.client.post(
+                "/api/v1/auth/otp/verify/",
+                json={
+                    "email": self.email,
+                    "otp": MAGIC_OTP,
+                    "device_id": self.device_id,
+                },
+                headers=self._headers(),
+                name="auth:otp_verify",
+                catch_response=True,
+            ) as ver:
                 if ver.status_code == 429:
                     ver.success()
-                else:
+                    time.sleep(0.5)
+                    continue
+                elif ver.status_code not in (200, 201):
                     ver.failure(f"verify {ver.status_code}: {(ver.text or '')[:120]}")
-                return
-            data = _json(ver) or {}
-            self.access = data.get("access")
-            self.refresh = data.get("refresh")
-            self.user_id = str(data.get("user_id") or "")
-            if not self.access:
-                ver.failure("no access token")
-                return
-            ver.success()
+                    return
+                data = _json(ver) or {}
+                self.access = data.get("access")
+                self.refresh = data.get("refresh")
+                self.user_id = str(data.get("user_id") or "")
+                if not self.access:
+                    ver.failure("no access token")
+                    return
+                ver.success()
+                break
+
+        if not self.access:
+            return
 
         self._req(
             "POST",
@@ -352,7 +367,7 @@ class SpyceUser(HttpUser):
 
     @task(8)
     def session_and_me(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req("GET", "/api/v1/users/me/", "users:me")
         self._req("GET", "/api/v1/auth/session/", "auth:session")
@@ -382,7 +397,7 @@ class SpyceUser(HttpUser):
 
     @task(1)
     def ws_ticket(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req("POST", "/api/v1/auth/ws-ticket/", "auth:ws_ticket", json={})
 
@@ -391,7 +406,7 @@ class SpyceUser(HttpUser):
     # ------------------------------------------------------------------ #
     @task(16)
     def feed_v1(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         res = self._req(
             "GET",
@@ -405,7 +420,7 @@ class SpyceUser(HttpUser):
     @task(6)
     def feed_v1_ai_refresh(self):
         """Feed AI cache refresh + multi-attribute filtering."""
-        if not self.access:
+        if not self._ensure_auth():
             return
         res = self._req(
             "GET",
@@ -427,7 +442,7 @@ class SpyceUser(HttpUser):
     @task(12)
     def feed_v2(self):
         """FastAPI v2 Feed."""
-        if not self.access:
+        if not self._ensure_auth():
             return
         res = self._req(
             "GET",
@@ -442,7 +457,7 @@ class SpyceUser(HttpUser):
     @task(6)
     def feed_v2_ai_refresh(self):
         """FastAPI v2 Feed with AI refresh and location mode filters."""
-        if not self.access:
+        if not self._ensure_auth():
             return
         res = self._req(
             "GET",
@@ -466,7 +481,7 @@ class SpyceUser(HttpUser):
     # ------------------------------------------------------------------ #
     @task(12)
     def like_candidate(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         target = self._pick_target()
         if not target:
@@ -486,7 +501,7 @@ class SpyceUser(HttpUser):
 
     @task(6)
     def interested(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         target = self._pick_target()
         if not target:
@@ -500,7 +515,7 @@ class SpyceUser(HttpUser):
 
     @task(5)
     def pass_candidate(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         target = self._pick_target()
         if not target:
@@ -514,7 +529,7 @@ class SpyceUser(HttpUser):
 
     @task(4)
     def received_likes(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         res = self._req("GET", "/api/v1/interaction/received/", "interaction:received")
         if res.status_code == 200:
@@ -523,7 +538,7 @@ class SpyceUser(HttpUser):
     @task(3)
     def start_conversation_request(self):
         """Send a direct connection/chat request to a candidate."""
-        if not self.access:
+        if not self._ensure_auth():
             return
         target = self._pick_target()
         if not target:
@@ -543,7 +558,7 @@ class SpyceUser(HttpUser):
     @task(2)
     def accept_conversation_request(self):
         """Accept an incoming connection/chat request."""
-        if not self.access or not self.user_id:
+        if not self._ensure_auth() or not self.user_id:
             return
         sender_id = _pop_pending_for(_pending_conversation_reqs, self.user_id)
         if not sender_id:
@@ -562,7 +577,7 @@ class SpyceUser(HttpUser):
     # ------------------------------------------------------------------ #
     @task(6)
     def matches(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         res = self._req("GET", "/api/v1/matches/", "matches:list")
         if res.status_code != 200:
@@ -581,7 +596,7 @@ class SpyceUser(HttpUser):
 
     @task(6)
     def conversations(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         res = self._req("GET", "/api/v1/conversations/", "conversations:list")
         if res.status_code != 200:
@@ -609,7 +624,7 @@ class SpyceUser(HttpUser):
 
     @task(4)
     def send_chat_message(self):
-        if not self.access or not self.conversation_ids:
+        if not self._ensure_auth() or not self.conversation_ids:
             return
         conv_id = self.conversation_ids[0]
         self._req(
@@ -628,14 +643,14 @@ class SpyceUser(HttpUser):
     # ------------------------------------------------------------------ #
     @task(8)
     def confession_list(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         res = self._req("GET", "/api/v1/social/", "confession:list")
         self._store_confessions(res)
 
     @task(8)
     def confession_feed(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         res = self._req(
             "GET",
@@ -647,7 +662,7 @@ class SpyceUser(HttpUser):
 
     @task(4)
     def confession_create(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         text = (
             f"Load-test confession {uuid.uuid4().hex[:8]} about late-night "
@@ -674,7 +689,7 @@ class SpyceUser(HttpUser):
     @task(8)
     def confession_engage(self):
         """Full confession interaction: Detail, Relate (Like), Repost, Comment, Report."""
-        if not self.access:
+        if not self._ensure_auth():
             return
         cid = None
         if self.confession_ids:
@@ -711,7 +726,7 @@ class SpyceUser(HttpUser):
     @task(3)
     def confession_chat_request(self):
         """Send anonymous chat request on a confession."""
-        if not self.access:
+        if not self._ensure_auth():
             return
         cid = _pool_pick(_confession_ids) or (
             self.confession_ids[0] if self.confession_ids else None
@@ -734,7 +749,7 @@ class SpyceUser(HttpUser):
     @task(3)
     def confession_requests_and_actions(self):
         """List incoming confession requests, check badge count, accept/reject."""
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req("GET", "/api/v1/social/moods/", "confession:moods")
         self._req("GET", "/api/v1/confession-requests/count/", "confession:request_count")
@@ -778,13 +793,13 @@ class SpyceUser(HttpUser):
     # ------------------------------------------------------------------ #
     @task(8)
     def profile_me(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req("GET", "/api/v1/profile/me/", "profile:me")
 
     @task(3)
     def profile_update(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self.lat, self.lon = _jitter_coords()
         self._req(
@@ -800,7 +815,7 @@ class SpyceUser(HttpUser):
 
     @task(4)
     def profile_other(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         target = self._pick_target()
         if not target:
@@ -809,7 +824,7 @@ class SpyceUser(HttpUser):
 
     @task(2)
     def profile_username_check(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req(
             "GET",
@@ -819,14 +834,14 @@ class SpyceUser(HttpUser):
 
     @task(2)
     def images_and_avatars(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req("GET", "/api/v1/images/upload-status/", "images:upload_status")
         self._req("GET", "/api/v1/avatars/", "avatars:list")
 
     @task(2)
     def mood(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req("GET", "/api/v1/mood/", "mood:get")
         if self.mood_ids:
@@ -842,7 +857,7 @@ class SpyceUser(HttpUser):
     # ------------------------------------------------------------------ #
     @task(3)
     def option_catalogs(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         for path, name in (
             ("/api/v1/genders/", "options:genders"),
@@ -856,14 +871,14 @@ class SpyceUser(HttpUser):
 
     @task(2)
     def theme(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req("GET", "/api/v1/theme/options/", "theme:options")
         self._req("GET", "/api/v1/theme/me/", "theme:me")
 
     @task(2)
     def geo(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req(
             "GET",
@@ -881,7 +896,7 @@ class SpyceUser(HttpUser):
     # ------------------------------------------------------------------ #
     @task(6)
     def last_active(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self.lat, self.lon = _jitter_coords()
         self._req(
@@ -893,7 +908,7 @@ class SpyceUser(HttpUser):
 
     @task(2)
     def devices_and_push(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req("GET", "/api/v1/users/devices/", "users:devices")
         self._req("GET", "/api/v1/notifications/", "notifications:list")
@@ -912,7 +927,7 @@ class SpyceUser(HttpUser):
     # ------------------------------------------------------------------ #
     @task(2)
     def subscriptions(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req("GET", "/api/v1/subscriptions/status/", "subscriptions:status")
         self._req("GET", "/api/v1/subscriptions/history/", "subscriptions:history")
@@ -921,7 +936,7 @@ class SpyceUser(HttpUser):
 
     @task(2)
     def call_and_wallet(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req("GET", "/api/v1/call/ice-servers/", "call:ice_servers")
         self._req("GET", "/api/v1/call/quota/", "call:quota")
@@ -933,7 +948,7 @@ class SpyceUser(HttpUser):
     # ------------------------------------------------------------------ #
     @task(2)
     def analytics_event(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req(
             "POST",
@@ -964,7 +979,7 @@ class SpyceUser(HttpUser):
 
     @task(1)
     def verification_and_blocks(self):
-        if not self.access:
+        if not self._ensure_auth():
             return
         self._req("GET", "/api/v1/verification/status/", "verification:status")
         self._req("GET", "/api/v1/moderation/blocks/", "moderation:blocks")

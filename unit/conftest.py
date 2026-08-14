@@ -2,8 +2,10 @@
 Django bootstrap for unit tests that import backend modules.
 
 PYTHONPATH:
-  - backend/datingapp        → package `core`
-  - backend/datingapp/core   → package `config`
+  - backend                 → package `core`
+  - backend/core            → package `config`
+  - backend/datingapp       → package `core`
+  - backend/datingapp/core  → package `config`
 """
 from __future__ import annotations
 
@@ -14,12 +16,19 @@ from pathlib import Path
 import pytest
 
 TESTING_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_ROOT = TESTING_ROOT.parent / "backend" / "datingapp"
-BACKEND_CORE = BACKEND_ROOT / "core"
+candidates = [
+    TESTING_ROOT.parent / "backend",
+    TESTING_ROOT.parent / "backend" / "core",
+    TESTING_ROOT.parent / "backend" / "datingapp",
+    TESTING_ROOT.parent / "backend" / "datingapp" / "core",
+]
 
-for p in (str(BACKEND_ROOT), str(BACKEND_CORE), str(TESTING_ROOT)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+for p in candidates:
+    if p.is_dir() and str(p) not in sys.path:
+        sys.path.insert(0, str(p))
+
+if str(TESTING_ROOT) not in sys.path:
+    sys.path.insert(0, str(TESTING_ROOT))
 
 # Prefer backend core env files if present (read-only)
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.dev")

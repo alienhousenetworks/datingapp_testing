@@ -8,7 +8,7 @@ UUID_B = "22222222-2222-2222-2222-222222222222"
 
 
 @pytest.mark.unit
-def test_is_user_uuid_rejects_integers():
+def test_is_user_uuid_rejects_integers(django_ready):
     from core.apps.interaction.persist_buffer import is_user_uuid
 
     assert is_user_uuid(UUID_A) is True
