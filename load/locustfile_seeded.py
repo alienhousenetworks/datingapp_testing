@@ -1,19 +1,28 @@
 """
 Product load test against pre-seeded complete users.
 
-This file does NOT sign up, mock-verify, or onboard. Those paths blocked
-feed/like/confession/chat and saturated workers in the previous run.
+Auth is NOT part of the load mix.
+Each virtual user logs in once on start (only if the seed row has no
+token). After that the loop hits real product APIs only:
 
-Each virtual user:
-  1. Claims one row from SEED_USERS_FILE (written by seed_load_users)
-  2. Logs in with MAGIC OTP (intent=login)
-  3. Loops real product actions with 4–9s think time
+  Feed load, send like, pass, interested, received likes,
+  send request / accept request,
+  chat list + send,
+  confession feed / create / like / repost / comment / chat-request,
+  profile me / other, matches.
+
+This file does NOT sign up, mock-verify, onboard, refresh tokens,
+or call session / ws-ticket / OTP again.
 
 Prerequisites
   - Users seeded: seed_load_users / seed-load-users.sh on KVM-B
   - APP env: ALLOW_LOAD_TESTING=true USE_TEST_OTP=true MAGIC_OTP=123456
              DISABLE_RATE_LIMITING=true
   - SEED_USERS_FILE pointing at the JSONL (default testing/load/load_users.jsonl)
+
+Optional seed columns (skip login entirely if present):
+  access | access_token | token
+  refresh | refresh_token
 
 Run
   SEED_USERS_FILE=testing/load/load_users.jsonl \\
@@ -44,6 +53,8 @@ _accounts: list[dict[str, Any]] = []
 _claim_idx = 0
 _feed_ids: deque[str] = deque(maxlen=4000)
 _confession_ids: deque[str] = deque(maxlen=2000)
+# (receiver_user_id, sender_user_id)
+_pending_conversation_reqs: deque[tuple[str, str]] = deque(maxlen=500)
 
 MOOD_TAGS = (
     "LONELY",
@@ -52,6 +63,12 @@ MOOD_TAGS = (
     "ANXIOUS",
     "GRATEFUL",
     "FANTASY",
+)
+
+REQUEST_NOTES = (
+    "Hey! Saw your profile on Discover — let's connect!",
+    "Your profile stood out. Want to chat?",
+    "Hi, would love to talk if you're open to it.",
 )
 
 
@@ -102,6 +119,14 @@ def _extract_ids(data, *keys: str) -> list[str]:
     return out
 
 
+def _seed_token(account: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        val = account.get(key)
+        if val:
+            return str(val)
+    return None
+
+
 def _load_accounts() -> None:
     path = Path(SEED_USERS_FILE)
     if not path.is_file():
@@ -146,17 +171,34 @@ def _pool_pick(pool: deque, exclude: str | None = None) -> Any | None:
     return random.choice(choices) if choices else None
 
 
+def _pop_pending_for(pool: deque[tuple[str, str]], target_receiver_id: str) -> str | None:
+    with _lock:
+        for item in list(pool):
+            receiver_id, payload_id = item
+            if receiver_id == target_receiver_id:
+                pool.remove(item)
+                return payload_id
+    return None
+
+
 @events.init.add_listener
 def _on_init(environment, **kwargs):
     _load_accounts()
+    with_tokens = sum(
+        1
+        for row in _accounts
+        if _seed_token(row, "access", "access_token", "token")
+    )
     print(
-        f"[SPYCE seeded load] accounts={len(_accounts)} file={SEED_USERS_FILE} "
-        f"host={getattr(environment, 'host', None)} MAGIC_OTP={MAGIC_OTP}"
+        f"[SPYCE seeded load] accounts={len(_accounts)} "
+        f"preissued_tokens={with_tokens} file={SEED_USERS_FILE} "
+        f"host={getattr(environment, 'host', None)} "
+        "auth=one-time-login-if-needed (no auth APIs in loop)"
     )
 
 
 class SeededProductUser(HttpUser):
-    """Logged-in complete user exercising Discover, social, and chat."""
+    """One login (if needed), then Discover / social / chat / profile only."""
 
     wait_time = between(4.0, 9.0)
     weight = 10
@@ -170,12 +212,19 @@ class SeededProductUser(HttpUser):
         self.lon = float(self.account.get("lon") or 77.5946)
         self.partner_id = self.account.get("partner_user_id")
         self.conversation_id = self.account.get("conversation_id")
-        self.access = None
-        self.refresh = None
+        self.access = _seed_token(self.account, "access", "access_token", "token")
+        self.refresh = _seed_token(self.account, "refresh", "refresh_token")
         self.feed_cursor = 0
         self.seen: deque[str] = deque(maxlen=80)
         self.confessions: deque[str] = deque(maxlen=40)
-        self._login()
+        if self.partner_id:
+            self.seen.append(str(self.partner_id))
+            _pool_add(_feed_ids, str(self.partner_id))
+        if not self.access:
+            self._login_once()
+        if not self.access:
+            # Do not burn the run on unauthenticated 401s.
+            self.stop(force=True)
 
     def _headers(self) -> dict:
         h = {
@@ -186,6 +235,9 @@ class SeededProductUser(HttpUser):
         if self.access:
             h["Authorization"] = f"Bearer {self.access}"
         return h
+
+    def _ready(self) -> bool:
+        return bool(self.access)
 
     def _req(
         self,
@@ -206,7 +258,8 @@ class SeededProductUser(HttpUser):
                 res.failure(f"{name} {res.status_code}: {(res.text or '')[:140]}")
         return res
 
-    def _login(self) -> None:
+    def _login_once(self) -> None:
+        """Single login per VU. Never called from feature tasks."""
         for _attempt in range(3):
             with self.client.post(
                 "/api/v1/auth/register/",
@@ -245,12 +298,6 @@ class SeededProductUser(HttpUser):
                 ver.success()
                 return
 
-    def _ensure(self) -> bool:
-        if self.access:
-            return True
-        self._login()
-        return bool(self.access)
-
     def _remember_feed(self, res) -> None:
         if res.status_code != 200:
             return
@@ -276,20 +323,20 @@ class SeededProductUser(HttpUser):
 
     def _pick_confession(self) -> str | None:
         if self.confessions:
-            return self.confessions[0]
+            return random.choice(list(self.confessions))
         return _pool_pick(_confession_ids)
 
     # ------------------------------------------------------------------ #
-    # Discover
+    # Discover — feed load
     # ------------------------------------------------------------------ #
     @task(20)
-    def feed_scroll(self):
-        if not self._ensure():
+    def feed_v2_load(self):
+        if not self._ready():
             return
         res = self._req(
             "GET",
             "/api/v2/feed/",
-            "feed:v2_scroll",
+            "feed:v2_load",
             params={
                 "count": 12,
                 "cursor": self.feed_cursor,
@@ -304,9 +351,24 @@ class SeededProductUser(HttpUser):
             if self.feed_cursor > 80:
                 self.feed_cursor = 0
 
+    @task(8)
+    def feed_v1_load(self):
+        if not self._ready():
+            return
+        res = self._req(
+            "GET",
+            "/api/v1/feed/",
+            "feed:v1_load",
+            params={"count": 10, "cursor": 0, "lat": self.lat, "lon": self.lon},
+        )
+        self._remember_feed(res)
+
+    # ------------------------------------------------------------------ #
+    # Likes / pass / interested / incoming likes
+    # ------------------------------------------------------------------ #
     @task(14)
-    def like_profile(self):
-        if not self._ensure():
+    def send_like(self):
+        if not self._ready():
             return
         target = self._pick_target()
         if not target:
@@ -323,7 +385,7 @@ class SeededProductUser(HttpUser):
 
     @task(5)
     def pass_profile(self):
-        if not self._ensure():
+        if not self._ready():
             return
         target = self._pick_target()
         if not target:
@@ -335,35 +397,100 @@ class SeededProductUser(HttpUser):
             json={"target_user_id": target},
         )
 
+    @task(5)
+    def send_interested(self):
+        if not self._ready():
+            return
+        target = self._pick_target()
+        if not target:
+            return
+        self._req(
+            "POST",
+            "/api/v1/interested/",
+            "interaction:interested",
+            json={"target_user_id": target},
+        )
+
     @task(4)
-    def view_profile(self):
-        if not self._ensure():
+    def received_likes(self):
+        if not self._ready():
+            return
+        res = self._req("GET", "/api/v1/interaction/received/", "interaction:received")
+        self._remember_feed(res)
+
+    # ------------------------------------------------------------------ #
+    # Send request / accept request
+    # ------------------------------------------------------------------ #
+    @task(5)
+    def send_conversation_request(self):
+        if not self._ready():
+            return
+        target = self._pick_target()
+        if not target:
+            return
+        res = self._req(
+            "POST",
+            "/api/v1/interaction/start_conversation/",
+            "interaction:send_request",
+            json={
+                "target_user_id": target,
+                "message": random.choice(REQUEST_NOTES),
+            },
+        )
+        if res.status_code in (200, 201) and self.user_id:
+            _pool_add(_pending_conversation_reqs, (target, self.user_id))
+
+    @task(3)
+    def accept_conversation_request(self):
+        if not self._ready() or not self.user_id:
+            return
+        sender_id = _pop_pending_for(_pending_conversation_reqs, self.user_id)
+        if not sender_id:
+            sender_id = self.partner_id or _pool_pick(_feed_ids, self.user_id)
+        if not sender_id:
+            return
+        res = self._req(
+            "POST",
+            "/api/v1/interaction/accept_request/",
+            "interaction:accept_request",
+            json={"sender_id": sender_id},
+        )
+        data = _json(res) or {}
+        if data.get("conversation_id"):
+            self.conversation_id = str(data["conversation_id"])
+
+    # ------------------------------------------------------------------ #
+    # Profile
+    # ------------------------------------------------------------------ #
+    @task(6)
+    def profile_me(self):
+        if not self._ready():
+            return
+        self._req("GET", "/api/v1/profile/me/", "profile:me")
+        self._req("GET", "/api/v1/users/me/", "users:me")
+
+    @task(5)
+    def profile_other(self):
+        if not self._ready():
             return
         target = self._pick_target() or self.partner_id
         if not target:
             return
         self._req("GET", f"/api/v1/profile/{target}/", "profile:other")
 
-    @task(3)
-    def received_likes(self):
-        if not self._ensure():
-            return
-        res = self._req("GET", "/api/v1/interaction/received/", "interaction:received")
-        self._remember_feed(res)
-
     # ------------------------------------------------------------------ #
-    # Confessions
+    # Confessions — load, create, like, repost, comment, chat request
     # ------------------------------------------------------------------ #
     @task(10)
-    def confession_list(self):
-        if not self._ensure():
+    def confession_list_load(self):
+        if not self._ready():
             return
         res = self._req("GET", "/api/v1/social/", "confession:list")
         self._remember_confessions(res)
 
     @task(10)
-    def confession_feed(self):
-        if not self._ensure():
+    def confession_feed_load(self):
+        if not self._ready():
             return
         res = self._req(
             "GET",
@@ -373,9 +500,9 @@ class SeededProductUser(HttpUser):
         )
         self._remember_confessions(res)
 
-    @task(2)
+    @task(3)
     def confession_create(self):
-        if not self._ensure():
+        if not self._ready():
             return
         text = (
             f"Load confession {uuid.uuid4().hex[:8]} about missed trains, "
@@ -401,18 +528,18 @@ class SeededProductUser(HttpUser):
             _pool_add(_confession_ids, str(cid))
 
     @task(8)
-    def confession_relate(self):
-        if not self._ensure():
+    def confession_like(self):
+        if not self._ready():
             return
         cid = self._pick_confession()
         if not cid:
             return
         self._req("GET", f"/api/v1/social/{cid}/", "confession:detail")
-        self._req("POST", f"/api/v1/social/{cid}/relate/", "confession:relate", json={})
+        self._req("POST", f"/api/v1/social/{cid}/relate/", "confession:like", json={})
 
     @task(4)
     def confession_repost(self):
-        if not self._ensure():
+        if not self._ready():
             return
         cid = self._pick_confession()
         if not cid:
@@ -421,7 +548,7 @@ class SeededProductUser(HttpUser):
 
     @task(4)
     def confession_comment(self):
-        if not self._ensure():
+        if not self._ready():
             return
         cid = self._pick_confession()
         if not cid:
@@ -436,17 +563,31 @@ class SeededProductUser(HttpUser):
         else:
             self._req("GET", f"/api/v1/social/{cid}/comments/", "confession:comments")
 
+    @task(3)
+    def confession_chat_request(self):
+        if not self._ready():
+            return
+        cid = self._pick_confession()
+        if not cid:
+            return
+        self._req(
+            "POST",
+            f"/api/v1/social/{cid}/chat-request/",
+            "confession:chat_request",
+            json={"message": "Hey, your confession hit hard. Want to talk about it?"},
+        )
+
     # ------------------------------------------------------------------ #
     # Chat / matches
     # ------------------------------------------------------------------ #
     @task(8)
-    def send_message(self):
-        if not self._ensure() or not self.conversation_id:
+    def send_chat(self):
+        if not self._ready() or not self.conversation_id:
             return
         self._req(
             "POST",
             "/api/v1/messages/",
-            "messages:send",
+            "chat:send",
             json={
                 "conversation": self.conversation_id,
                 "content": {"text": f"hey {uuid.uuid4().hex[:6]} — seeded chat load"},
@@ -455,10 +596,10 @@ class SeededProductUser(HttpUser):
         )
 
     @task(6)
-    def conversations(self):
-        if not self._ensure():
+    def chat_load(self):
+        if not self._ready():
             return
-        res = self._req("GET", "/api/v1/conversations/", "conversations:list")
+        res = self._req("GET", "/api/v1/conversations/", "chat:conversations")
         if res.status_code != 200:
             return
         ids = _extract_ids(_json(res), "id")
@@ -467,46 +608,16 @@ class SeededProductUser(HttpUser):
         conv_id = self.conversation_id or (ids[0] if ids else None)
         if not conv_id:
             return
+        self._req("GET", f"/api/v1/conversations/{conv_id}/", "chat:conversation_detail")
         self._req(
             "GET",
             "/api/v1/messages/",
-            "messages:list",
+            "chat:messages",
             params={"conversation_id": conv_id},
         )
 
     @task(4)
-    def matches(self):
-        if not self._ensure():
+    def matches_load(self):
+        if not self._ready():
             return
         self._req("GET", "/api/v1/matches/", "matches:list")
-
-    # ------------------------------------------------------------------ #
-    # Presence (same coords as seed — avoids full profile.save())
-    # ------------------------------------------------------------------ #
-    @task(3)
-    def heartbeat(self):
-        if not self._ensure():
-            return
-        self._req(
-            "POST",
-            "/api/v1/users/last-active/",
-            "users:heartbeat",
-            json={"lat": self.lat, "lon": self.lon},
-        )
-
-    @task(1)
-    def token_refresh(self):
-        if not self.refresh:
-            return
-        res = self._req(
-            "POST",
-            "/api/v1/token/refresh/",
-            "auth:token_refresh",
-            json={"refresh": self.refresh},
-            also_ok=(400, 401, 429),
-        )
-        data = _json(res) or {}
-        if res.status_code == 200 and data.get("access"):
-            self.access = data["access"]
-            if data.get("refresh"):
-                self.refresh = data["refresh"]

@@ -61,12 +61,18 @@ pytest integration/ -v
 
 ### 3. Load tests
 
+Product capacity test uses **seeded complete users** and one-time login
+only (no auth APIs in the loop):
+
 ```bash
-export BASE_URL=http://127.0.0.1:8000
-./scripts/run_load.sh
+export BASE_URL=https://api01.spycenow.com
+export SEED_USERS_FILE=load/load_users.jsonl
+./scripts/run_seeded_load.sh
 # or
-locust -f load/locustfile.py --host "$BASE_URL"
+locust -f load/locustfile_seeded.py --host "$BASE_URL"
 ```
+
+`load/locustfile.py` is the older signup-onboard file, not a product-capacity test.
 
 ### Run everything
 

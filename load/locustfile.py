@@ -1,8 +1,9 @@
 """
 Locust load tests for the SPYCE dating API.
 
-Each virtual user signs up (magic OTP), completes onboarding, then loops
-across the real client surfaces:
+Each virtual user signs up once (magic OTP) and completes onboarding,
+then loops across the real client surfaces. Auth APIs are not in the
+load mix after that first login:
 - Feed & Feed AI (Django v1 + FastAPI v2 with filters & cache refresh)
 - Like / Pass / Interested / Received Likes / Matches
 - Send Request & Accept Request (Direct Conversation Requests)
@@ -220,10 +221,7 @@ class SpyceUser(HttpUser):
         return _pool_pick(_feed_ids, self.user_id) or _pool_pick(_user_ids, self.user_id)
 
     def _ensure_auth(self) -> bool:
-        if self.access:
-            return True
-        self._authenticate_and_onboard()
-        return self.access is not None
+        return bool(self.access)
 
     def _authenticate_and_onboard(self):
         # Retry authentication if rate-limited during high-concurrency spawn
@@ -366,40 +364,10 @@ class SpyceUser(HttpUser):
         self._req("GET", "/health/ready/", "health:ready", also_ok=(404, 429))
 
     @task(8)
-    def session_and_me(self):
+    def users_me(self):
         if not self._ensure_auth():
             return
         self._req("GET", "/api/v1/users/me/", "users:me")
-        self._req("GET", "/api/v1/auth/session/", "auth:session")
-
-    @task(2)
-    def token_refresh(self):
-        if not self.refresh:
-            return
-        res = self._req(
-            "POST",
-            "/api/v1/token/refresh/",
-            "auth:token_refresh",
-            json={"refresh": self.refresh},
-            also_ok=(400, 401, 429),
-        )
-        data = _json(res) or {}
-        if res.status_code == 200 and data.get("access"):
-            self.access = data["access"]
-        if self.access:
-            self._req(
-                "POST",
-                "/api/v1/token/verify/",
-                "auth:token_verify",
-                json={"token": self.access},
-                also_ok=(400, 401, 429),
-            )
-
-    @task(1)
-    def ws_ticket(self):
-        if not self._ensure_auth():
-            return
-        self._req("POST", "/api/v1/auth/ws-ticket/", "auth:ws_ticket", json={})
 
     # ------------------------------------------------------------------ #
     # Feed & Feed AI (Django v1 + FastAPI v2 + AI recalculation & filters)
@@ -985,46 +953,11 @@ class SpyceUser(HttpUser):
         self._req("GET", "/api/v1/moderation/blocks/", "moderation:blocks")
 
 
-class AuthOnlyUser(HttpUser):
-    """Signup storm only (register + magic OTP)."""
-
-    wait_time = between(2.0, 5.0)
-    weight = 1
-
-    @task
-    def signup_flow(self):
-        email = _email()
-        device = _device()
-        headers = {"Content-Type": "application/json", "X-Device-ID": device}
-        with self.client.post(
-            "/api/v1/auth/register/",
-            json={"email": email, "device_id": device, "intent": "signup"},
-            headers=headers,
-            name="storm:register",
-            catch_response=True,
-        ) as res:
-            if res.status_code in (200, 201, 429):
-                res.success()
-            else:
-                res.failure(f"storm:register {res.status_code}: {(res.text or '')[:100]}")
-
-        with self.client.post(
-            "/api/v1/auth/otp/verify/",
-            json={"email": email, "otp": MAGIC_OTP, "device_id": device},
-            headers=headers,
-            name="storm:verify",
-            catch_response=True,
-        ) as res:
-            if res.status_code in (200, 201, 429):
-                res.success()
-            else:
-                res.failure(f"storm:verify {res.status_code}: {(res.text or '')[:100]}")
-
-
 @events.init.add_listener
 def on_locust_init(environment, **kwargs):
     print(
         f"[SPYCE load] MAGIC_OTP={MAGIC_OTP} | "
-        "full API (feed/feed AI/like/pass/requests/confessions/profile/etc) | "
+        "one-time signup then feature APIs "
+        "(feed/like/pass/requests/confessions/chat/profile) | "
         f"host={getattr(environment, 'host', None)}"
     )

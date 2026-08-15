@@ -2,6 +2,10 @@
 
 ## Product test (seeded complete users) — use this
 
+Auth is **not** part of the load mix. Each virtual user logs in **once**
+on start (only if the seed row has no access token). The loop then hits
+real product APIs only.
+
 Signup-on-start cannot use feed/like/confession/chat (incomplete + unverified).
 Seed 10k complete users **on KVM-B (APP)**, then run `locustfile_seeded.py`.
 
@@ -30,6 +34,24 @@ Or: `./scripts/run_seeded_load.sh`
 
 Keep `--users` at or below the seeded count.
 
+Optional JSONL columns: `access` / `access_token` / `token` (and
+`refresh` / `refresh_token`). If `access` is present, Locust skips login
+entirely.
+
+## What the seeded loop hits
+
+| Area | Requests |
+|------|----------|
+| Feed load | `GET /api/v2/feed/`, `GET /api/v1/feed/` |
+| Like / pass / interested | `POST /interaction/send/`, `/pass/`, `POST /interested/`, `GET /received/` |
+| Send request | `POST /interaction/start_conversation/`, `POST /interaction/accept_request/` |
+| Chat | `GET /conversations/`, `GET /conversations/{id}/`, `GET /messages/`, `POST /messages/` |
+| Confessions | list, geo feed, create, detail, relate (like), repost, comments, chat-request |
+| Profile | `GET /profile/me/`, `GET /users/me/`, `GET /profile/{id}/` |
+| Matches | `GET /matches/` |
+
+**Not** in the loop: register, OTP, token refresh, session, ws-ticket.
+
 ## Signup-storm file (old)
 
 `locustfile.py` still exists for auth/onboarding stress. It is **not** a product-capacity test.
@@ -50,7 +72,7 @@ Keep `--users` at or below the seeded count.
 ```bash
 cd testing
 source .venv/bin/activate   # if used
-locust -f load/locustfile.py --host http://127.0.0.1:8000
+locust -f load/locustfile_seeded.py --host https://api01.spycenow.com
 ```
 
 Open http://localhost:8089
@@ -58,42 +80,27 @@ Open http://localhost:8089
 ## Run (headless)
 
 ```bash
-locust -f load/locustfile.py --host http://127.0.0.1:8000 \
-  --users 20 --spawn-rate 5 --run-time 60s --headless
+SEED_USERS_FILE=load/load_users.jsonl \
+  locust -f load/locustfile_seeded.py --host https://api01.spycenow.com \
+  --users 500 --spawn-rate 20 --run-time 10m --headless
 ```
 
 Or:
 
 ```bash
-./scripts/run_load.sh
+./scripts/run_seeded_load.sh
 ```
 
 ## User classes
 
-| Class | Weight | Behavior |
-|-------|--------|----------|
-| `SpyceUser` | 10 | Full session: magic OTP signup → mock face → complete profile → loop every client API |
-| `AuthOnlyUser` | 1 | Auth storm only (register + verify) |
-
-`SpyceUser` hits the real product paths, not just onboarding:
-
-| Area | Requests |
-|------|----------|
-| Feed | `GET /api/v1/feed/`, `GET /api/v2/feed/` |
-| Likes / match | `POST /interaction/send/`, `/pass/`, `/interested/`, `GET /received/`, `GET /matches/` |
-| Chat | `GET /conversations/`, `GET /messages/`, `POST /messages/` |
-| Confessions | list, geo feed, create, relate, repost, comments, chat-request |
-| Profile | `GET/PATCH /profile/me/`, `GET /profile/{id}/`, username check, avatars, mood |
-| Presence / geo | `POST /users/last-active/`, reverse + city autocomplete |
-| Catalogs / theme | genders, sexualities, intents, turn_ons, moods, languages, theme |
-| Wallet / calls | subscription status, ICE servers, call quota/wallet |
-| Other | session, token refresh, WS ticket, analytics, verification, blocks |
-
-Virtual users share a pool of IDs so likes can land on other load-test users and produce matches.
+| Class | File | Behavior |
+|-------|------|----------|
+| `SeededProductUser` | `locustfile_seeded.py` | One login if needed, then feature APIs only |
+| `SpyceUser` | `locustfile.py` | Signup + onboard once, then feature APIs (no auth storm) |
 
 ## Notes
 
-- Each virtual user creates a unique email (`load+…@example.com`).
-- OTP is always `MAGIC_OTP` (default `123456`).
+- Seeded VUs claim one row from `load_users.jsonl` (email + device + partner chat).
+- OTP is always `MAGIC_OTP` (default `123456`) and is used at most once per VU.
 - Captcha tokens are never sent.
-- Real face liveness is never called; mock-complete runs once on start.
+- Failed login stops that VU instead of retrying auth in the loop.
