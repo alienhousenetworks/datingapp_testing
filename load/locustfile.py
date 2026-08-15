@@ -225,27 +225,37 @@ class SpyceUser(HttpUser):
 
     def _authenticate_and_onboard(self):
         # Retry authentication if rate-limited during high-concurrency spawn
-        for attempt in range(3):
+        for attempt in range(5):
             with self.client.post(
-                "/api/v1/auth/register/",
+                "/api/v1/auth/login_otp/",
                 json={
                     "email": self.email,
                     "device_id": self.device_id,
-                    "intent": "signup",
                 },
                 headers=self._headers(),
-                name="auth:register",
+                name="auth:login_otp",
                 catch_response=True,
             ) as reg:
-                if reg.status_code in (200, 201):
+                if reg.status_code in (200, 201, 409):
                     reg.success()
                 elif reg.status_code == 429:
                     reg.success()
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     continue
                 else:
-                    reg.failure(f"register {reg.status_code}: {(reg.text or '')[:120]}")
-                    return
+                    # Fall back to register endpoint if login_otp is not routed
+                    with self.client.post(
+                        "/api/v1/auth/register/",
+                        json={
+                            "email": self.email,
+                            "device_id": self.device_id,
+                        },
+                        headers=self._headers(),
+                        name="auth:register",
+                        catch_response=True,
+                    ) as reg2:
+                        if reg2.status_code in (200, 201, 409, 429):
+                            reg2.success()
 
             with self.client.post(
                 "/api/v1/auth/otp/verify/",
@@ -260,18 +270,19 @@ class SpyceUser(HttpUser):
             ) as ver:
                 if ver.status_code == 429:
                     ver.success()
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     continue
                 elif ver.status_code not in (200, 201):
                     ver.failure(f"verify {ver.status_code}: {(ver.text or '')[:120]}")
-                    return
+                    time.sleep(0.3)
+                    continue
                 data = _json(ver) or {}
                 self.access = data.get("access")
                 self.refresh = data.get("refresh")
                 self.user_id = str(data.get("user_id") or "")
                 if not self.access:
                     ver.failure("no access token")
-                    return
+                    continue
                 ver.success()
                 break
 
