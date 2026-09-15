@@ -38,6 +38,7 @@ os.environ.setdefault("DEBUG", "True")
 # Force test-mode flags (override any ambient production-ish env)
 os.environ["USE_TEST_OTP"] = "True"
 os.environ["MAGIC_OTP"] = os.environ.get("MAGIC_OTP", "123456")
+os.environ["ENABLE_LEGACY_OTP_AUTH"] = "True"
 os.environ["REQUIRE_CAPTCHA"] = "False"
 os.environ["FACE_VERIFICATION"] = "False"
 os.environ["ALLOW_MOCK_VERIFICATION"] = "True"
@@ -57,6 +58,7 @@ def pytest_configure(config):
             # Ensure critical flags even if already configured
             settings.USE_TEST_OTP = True
             settings.MAGIC_OTP = os.environ.get("MAGIC_OTP", "123456")
+            settings.ENABLE_LEGACY_OTP_AUTH = True
             settings.REQUIRE_CAPTCHA = False
             settings.CAPTCHA_VERIFICATION_ACTIVE = False
             settings.FACE_VERIFICATION = False
@@ -90,6 +92,7 @@ def force_test_flags(django_ready):
     cm = override_settings(
         USE_TEST_OTP=True,
         MAGIC_OTP="123456",
+        ENABLE_LEGACY_OTP_AUTH=True,
         REQUIRE_CAPTCHA=False,
         CAPTCHA_VERIFICATION_ACTIVE=False,
         FACE_VERIFICATION=False,

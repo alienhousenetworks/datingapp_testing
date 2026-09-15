@@ -5,6 +5,7 @@ cd "$ROOT"
 
 export USE_TEST_OTP=True
 export MAGIC_OTP="${MAGIC_OTP:-123456}"
+export ENABLE_LEGACY_OTP_AUTH=True
 export REQUIRE_CAPTCHA=False
 export FACE_VERIFICATION=False
 export ALLOW_MOCK_VERIFICATION=True

@@ -17,6 +17,7 @@ These are applied by the suite (and expected on the server for integration/load)
 | Flag | Value | Effect |
 |------|-------|--------|
 | `USE_TEST_OTP` | `True` | Magic OTP path |
+| `ENABLE_LEGACY_OTP_AUTH` | `True` | Keep Email OTP APIs while Firebase login is tested |
 | `MAGIC_OTP` | `123456` | Fixed OTP (no real email) |
 | `REQUIRE_CAPTCHA` | `False` | Bot / Turnstile off |
 | `FACE_VERIFICATION` | `False` | Mock face path |
